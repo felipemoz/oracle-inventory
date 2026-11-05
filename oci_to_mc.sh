@@ -1128,7 +1128,10 @@ collect_oci() {
   total_metrics="$(wc -l < "$RAW_DIR/metrics.jsonl" 2>/dev/null | tr -d ' ' || echo 0)"
   total_errs="$(wc -l < "$RAW_DIR/errors.jsonl" 2>/dev/null | tr -d ' ' || echo 0)"
   regions_json="$(printf '%s\n' "${TARGET_REGIONS[@]}" | jq -R . | jq -s -c . 2>/dev/null || echo '[]')"
-  per_region="$(jq -s -c 'unique_by(.id) | group_by(._oci_region // "default") | map({key: (.[0]._oci_region // "default"), value: length}) | from_entries' "$RAW_DIR/instances.jsonl" 2>/dev/null || echo '{}')"
+  per_region="$(jq -s -c --arg fb "$FALLBACK_REGION" '
+    def rf: if . == null or . == "" then null elif . == "iad" then "us-ashburn-1" elif . == "phx" then "us-phoenix-1" else . end;
+    def rk: ((._oci_region // null) // (.region | rf) // (if $fb != "" then $fb else null end) // "default");
+    unique_by(.id) | map(. + {_rk: rk}) | group_by(._rk) | map({key: .[0]._rk, value: length}) | from_entries' "$RAW_DIR/instances.jsonl" 2>/dev/null || echo '{}')"
   elapsed=$((SECONDS - t_total))
 
   jq -n \
