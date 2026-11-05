@@ -13,6 +13,10 @@ A resilient, standalone Bash utility for extracting compute instance inventory, 
   - `compute-only` (`3`, ultra-fast): Extracts only VMs (`compute instance list`) and OS images (`compute image get`).
   - `metrics-only` (`4`, complementary): Queries MQL metrics **only** on compartments that already contain active VMs in `--raw-dir/instances.jsonl`.
 - **Multi-Region by Default**: Automatically discovers every subscribed OCI region (`iam region-subscription list`) — not only the home region where the tenancy was created — and uses regional **OCI Resource Search** to scan only the compartments that actually contain instances in each region (with a safe full-scan fallback). Restrict with `--regions sa-saopaulo-1,sa-vinhedo-1`.
+- **Parallel, Low-Call-Count Collection**:
+  - Bounded parallel engine (`-P / --parallel`, default `8`) runs independent OCI CLI calls concurrently: regional searches, per-compartment instance lists, VNIC/volume/boot-volume lists, OS image lookups and metric queries.
+  - Tenancy-wide metrics (`--metrics-scope auto`, default when scanning from the tenancy root): **one** MQL query per metric per region (`compartmentIdInSubtree=true`) instead of one per compartment, with automatic per-compartment fallback if OCI rejects the query (e.g. too many data points).
+  - Milestone 2 generates the four CSVs concurrently.
 - **Two Decoupled Milestones**:
   - **Milestone 1 (`collect`)**: Discovers compartments, queries compute instances, attached boot/block volumes, VNICs, and extracts historical performance metrics into a local JSONL snapshot (`./oci_raw_snapshot/`).
   - **Milestone 2 (`export`)**: Processes the snapshot **100% offline** (zero OCI or GCP network calls) and outputs validated Migration Center CSVs (`./mc_export_csv/`).
@@ -128,7 +132,22 @@ By default `run` / `collect` cover **all** subscribed regions. To limit the scop
 
 Each VM is exported with `HostingLocation` set to the region it was collected from, plus an `oci:region` tag in `tagInfo.csv`.
 
-### 3. Choosing the Collection Type (`--collect-type`)
+### 3. Tuning Speed (`-P / --parallel`, `--metrics-scope`)
+
+```bash
+# Default: 8 concurrent OCI CLI calls + tenancy-wide metric queries
+./oci_to_mc.sh run --collect-type full -v
+
+# Large tenancy with headroom: raise concurrency (OCI throttling/HTTP 429 is retried automatically)
+./oci_to_mc.sh run --collect-type full -P 16 -v
+
+# Constrained shell or strict API limits: lower concurrency
+./oci_to_mc.sh run --collect-type full -P 4 -v
+```
+
+Each OCI CLI call is a separate Python process, so very high `-P` values mostly add memory pressure and throttling rather than speed. The per-phase timings printed in the log (`Phase 1/4 ... Phase 4/4`) and `manifest.json` (`execution.elapsed_seconds`) help pick the right value.
+
+### 4. Choosing the Collection Type (`--collect-type`)
 
 You can select the extraction scope interactively when running in a terminal, or pass `-t / --collect-type` for `nohup` / background runs:
 
@@ -147,7 +166,7 @@ nohup ./oci_to_mc.sh collect --collect-type metrics-only -v > nohup_metrics.out 
 ./oci_to_mc.sh export
 ```
 
-### 4. Standalone Workflow (Step-by-Step)
+### 5. Standalone Workflow (Step-by-Step)
 
 ```bash
 # Step 1: Validate configuration and IAM permissions
@@ -160,7 +179,7 @@ nohup ./oci_to_mc.sh collect --collect-type metrics-only -v > nohup_metrics.out 
 ./oci_to_mc.sh export --out-dir ./mc_export_csv
 ```
 
-### 5. Anonymized Execution
+### 6. Anonymized Execution
 
 To mask hostnames, IPs, MACs, and OCIDs via SHA-256 before sharing CSVs:
 
@@ -189,6 +208,8 @@ To mask hostnames, IPs, MACs, and OCIDs via SHA-256 before sharing CSVs:
 | `--read-timeout <SEC>` | `90` | OCI CLI HTTP read timeout |
 | `--cmd-timeout <SEC>` | `180` | OS watchdog timeout per command before SIGKILL |
 | `--retries <INT>` | `3` | Max retry attempts for transient timeout/network failures |
+| `-P, --parallel <N>` | `8` | Max concurrent OCI CLI calls (`1` = sequential, max `64`) |
+| `--metrics-scope <MODE>` | `auto` | `auto`/`region` = one tenancy-wide MQL query per metric per region; `compartment` = one per compartment |
 | `--max-metric-timeouts <INT>` | `2` | Circuit breaker: skip remaining MQL queries in a compartment after N consecutive timeouts |
 | `--resume` | Disabled | Skip compartments completed successfully in a previous run |
 | `--anonymize` | Disabled | Deterministically mask IDs, hostnames, IPs, and MACs via SHA-256 |

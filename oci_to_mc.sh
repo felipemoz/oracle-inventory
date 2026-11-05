@@ -5,7 +5,8 @@
 # OCI CLI -> Google Cloud Migration Center Exporter (2 Decoupled Milestones)
 #   Milestone 1 (collect): Runs read-only OCI CLI commands across ALL subscribed
 #                          OCI regions (or --regions list) with preflight config
-#                          verification, selectable collection type (full,
+#                          verification, bounded parallel execution (-P N),
+#                          tenancy-wide metric queries, selectable collection type (full,
 #                          inventory, compute-only, metrics-only), verbose
 #                          step-by-step telemetry, 4-layer timeout/retry
 #                          handling, and per-compartment resume checkpoints.
@@ -44,6 +45,13 @@ CMD_TIMEOUT=180
 RETRIES=3
 BACKOFF_BASE=2
 MAX_METRIC_TIMEOUTS=2
+PARALLEL=8
+METRICS_SCOPE="auto"
+EFF_METRICS_SCOPE="compartment"
+WIN_START=""
+WIN_END=""
+MQL_SPECS=()
+POOL_READY=""
 RAW_DIR="./oci_raw_snapshot"
 OUT_DIR="./mc_export_csv"
 MAX_MB=95
@@ -88,6 +96,11 @@ Options:
   --cmd-timeout <SEC>            OS watchdog timeout per OCI CLI process in seconds (default: 180)
   --retries <INT>                Max attempts on timeout/transient errors (default: 3)
   --backoff-base <SEC>           Exponential backoff base seconds (default: 2)
+  -P, --parallel <N>             Max concurrent OCI CLI calls (default: 8; 1 = sequential, max 64). Each call is a
+                                 separate Python process: lower it if Cloud Shell runs short of memory or OCI returns 429
+  --metrics-scope <MODE>         auto | region | compartment (default: auto = region when scanning from the tenancy root).
+                                 'region' sends ONE tenancy-wide MQL query per metric per region (compartmentIdInSubtree)
+                                 instead of one per compartment, and falls back to per-compartment queries if it fails
   --max-metric-timeouts <INT>    Circuit breaker: skip remaining MQL queries in a compartment after N consecutive metric timeouts (default: 2)
   --raw-dir <DIR>                Snapshot directory for Milestone 1 (default: ./oci_raw_snapshot)
   --out-dir <DIR>                Output CSV directory for Milestone 2 (default: ./mc_export_csv)
@@ -119,6 +132,8 @@ while [[ $# -gt 0 ]]; do
     --retries)                RETRIES="${2:-}"; shift 2 ;;
     --backoff-base)           BACKOFF_BASE="${2:-}"; shift 2 ;;
     --max-metric-timeouts)    MAX_METRIC_TIMEOUTS="${2:-}"; shift 2 ;;
+    -P|--parallel)            PARALLEL="${2:-}"; shift 2 ;;
+    --metrics-scope)          METRICS_SCOPE="${2:-}"; shift 2 ;;
     --raw-dir)                RAW_DIR="${2:-}"; shift 2 ;;
     --out-dir)                OUT_DIR="${2:-}"; shift 2 ;;
     --max-mb)                 MAX_MB="${2:-}"; shift 2 ;;
@@ -209,6 +224,10 @@ check_local_deps() {
 validate_window_params() {
   [[ "$DAYS" =~ ^[0-9]+$ && "$DAYS" -ge 1 ]] || die "--days must be a positive integer (got '$DAYS')."
   [[ "$RETRIES" =~ ^[0-9]+$ && "$RETRIES" -ge 1 ]] || die "--retries must be >= 1 (got '$RETRIES')."
+  [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 && "$PARALLEL" -le 64 ]] || die "--parallel must be an integer between 1 and 64 (got '$PARALLEL')."
+  if [[ "$PARALLEL" -gt 16 ]]; then
+    log_warn "--parallel $PARALLEL is high: OCI may throttle (HTTP 429, retried automatically) and each concurrent call is a separate Python process."
+  fi
   case "$RESOLUTION" in
     1m) [[ "$DAYS" -le 7 ]]  || die "--resolution 1m supports at most --days 7 in OCI Monitoring (got $DAYS)." ;;
     5m) [[ "$DAYS" -le 30 ]] || die "--resolution 5m supports at most --days 30 in OCI Monitoring (got $DAYS)." ;;
@@ -553,52 +572,252 @@ search_region_instances() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Bounded parallel task pool.
+# Portable to bash 4.2 (Oracle Linux 7): FIFO token semaphore instead of `wait -n`.
+# Every task runs in its own subshell with its own error flag, so one failing or
+# timing-out OCI call never blocks or aborts the others.
+# ---------------------------------------------------------------------------
+pool_init() {
+  [[ -n "${POOL_READY:-}" ]] && return 0
+  local f="$TMP_WORK/pool.fifo" i
+  mkfifo "$f"
+  exec 9<>"$f"
+  rm -f "$f"
+  for ((i = 0; i < PARALLEL; i++)); do printf 'x\n' >&9; done
+  POOL_READY=1
+}
+
+pool_run() {
+  local label="$1" _tok=""
+  shift
+  read -r -u 9 _tok
+  {
+    _rc=0
+    ( "$@" ) || _rc=$?
+    if [[ "$_rc" -ne 0 ]]; then
+      log_warn "Task '$label' exited unexpectedly (rc=$_rc); continuing with remaining tasks."
+    fi
+    printf 'x\n' >&9
+  } &
+}
+
+pool_wait() {
+  wait || true
+}
+
+# Per-task context: region routing + private error/timeout flags.
+task_ctx() {
+  CUR_REGION="$1"
+  COMP_ERR_FLAG="$2"
+  LAST_CALL_TIMED_OUT="$TMP_WORK/to_${BASHPID}"
+  rm -f "$COMP_ERR_FLAG"
+}
+
+MQL_JQ='.data[]? |
+  ((.dimensions.resourceId // .dimensions.RESOURCEID // "") | tostring) as $rid |
+  select($rid != "") |
+  (.["aggregated-datapoints"] // [])[] |
+  select(.value != null and .timestamp != null) |
+  {metric_key: $mk, resource_id: $rid, timestamp: .timestamp, value: .value}'
+
+task_search() {
+  local r="$1" idx="$2"
+  task_ctx "$r" "$TMP_WORK/search_${idx}.err"
+  if search_region_instances "$r" "$TMP_WORK/search_${idx}.txt"; then
+    touch "$TMP_WORK/search_${idx}.ok"
+  fi
+}
+
+task_instances() {
+  local r="$1" cid="$2" cdir="$3"
+  task_ctx "$r" "$cdir/.err_instances"
+  local tmp="$TMP_WORK/inst_${BASHPID}.json"
+  run_oci "compute:instance-list" "$cid" NONFATAL compute instance list --compartment-id "$cid" --all > "$tmp"
+  jq -c --arg r "$r" '.data[]? | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | . + {"_oci_region": $r}' "$tmp" > "$cdir/instances.jsonl" 2>/dev/null || : > "$cdir/instances.jsonl"
+  rm -f "$tmp"
+}
+
+# task_list <region> <cid> <step> <out_jsonl> <errflag> <oci args...>
+task_list() {
+  local r="$1" cid="$2" step="$3" out="$4" errf="$5"
+  shift 5
+  task_ctx "$r" "$errf"
+  local tmp="$TMP_WORK/list_${BASHPID}.json"
+  run_oci "$step" "$cid" NONFATAL "$@" > "$tmp"
+  jq -c '.data[]?' "$tmp" > "$out" 2>/dev/null || : > "$out"
+  rm -f "$tmp"
+}
+
+task_image() {
+  local r="$1" img_id="$2" img_file="$3"
+  task_ctx "$r" "${img_file}.err"
+  local tmp="$TMP_WORK/img_${BASHPID}.json"
+  log_verb "[${r:-default}] Inspecting OS image metadata: $img_id"
+  run_oci "compute:image-get" "$img_id" NONFATAL compute image get --image-id "$img_id" > "$tmp"
+  if [[ ! -f "$COMP_ERR_FLAG" ]]; then
+    jq -c '.data | select(type == "object" and (.id // "") != "")' "$tmp" > "$img_file" 2>/dev/null || rm -f "$img_file"
+  fi
+  rm -f "$tmp" "$COMP_ERR_FLAG"
+}
+
+# One tenancy-wide MQL query (compartmentIdInSubtree=true) for one metric in one region.
+task_region_metric() {
+  local r="$1" spec="$2" rdir="$3" mkey mns mquery
+  IFS='|' read -r mkey mns mquery <<< "$spec"
+  task_ctx "$r" "$rdir/.err_${mkey}"
+  local tmp="$TMP_WORK/rm_${BASHPID}.json"
+  log_verb "[region ${r:-default}] Querying tenancy-wide MQL metric '${mkey}' ($mns) in a single call..."
+  run_oci "monitoring:region:${mkey}" "$TENANCY_ID" NONFATAL \
+    monitoring metric-data summarize-metrics-data \
+    --compartment-id "$TENANCY_ID" \
+    --compartment-id-in-subtree true \
+    --namespace "$mns" \
+    --query-text "$mquery" \
+    --start-time "$WIN_START" \
+    --end-time "$WIN_END" \
+    --resolution "$RESOLUTION" > "$tmp"
+  if [[ -f "$COMP_ERR_FLAG" ]]; then
+    rm -f "$rdir/metrics_${mkey}.jsonl" "$tmp"
+    return 0
+  fi
+  if ! jq -c --arg mk "$mkey" "$MQL_JQ" "$tmp" > "$rdir/metrics_${mkey}.jsonl" 2>/dev/null; then
+    echo "1" > "$COMP_ERR_FLAG"
+    rm -f "$rdir/metrics_${mkey}.jsonl"
+  fi
+  rm -f "$tmp"
+}
+
+# Per-compartment MQL queries (sequential inside the task, with timeout circuit breaker).
+# task_comp_metrics <region> <cid> <cdir> <cname> <tag> <comma-separated metric keys> <outfile> <errflag>
+task_comp_metrics() {
+  local r="$1" cid="$2" cdir="$3" cname="$4" tag="$5" keys="$6" out="$7" errf="$8"
+  task_ctx "$r" "$errf"
+  local spec mkey mns mquery consec=0 tmp="$TMP_WORK/cm_${BASHPID}.json"
+  : > "$out"
+  for spec in "${MQL_SPECS[@]}"; do
+    IFS='|' read -r mkey mns mquery <<< "$spec"
+    [[ ",$keys," == *",$mkey,"* ]] || continue
+    if [[ "$MAX_METRIC_TIMEOUTS" -gt 0 && "$consec" -ge "$MAX_METRIC_TIMEOUTS" ]]; then
+      log_warn "$tag Circuit breaker active: skipping 'monitoring:${mkey}' in $cname after $consec consecutive MQL timeouts."
+      echo "1" > "$COMP_ERR_FLAG"
+      record_oci_error "monitoring:${mkey}" "$cid" 124 0 "CIRCUIT_BREAKER_SKIPPED_AFTER_TIMEOUTS" "Skipped after $consec consecutive MQL timeouts in compartment"
+      continue
+    fi
+    log_verb "$tag Querying MQL metric '${mkey}' ($mns) for $cname..."
+    run_oci "monitoring:${mkey}" "$cid" NONFATAL \
+      monitoring metric-data summarize-metrics-data \
+      --compartment-id "$cid" \
+      --namespace "$mns" \
+      --query-text "$mquery" \
+      --start-time "$WIN_START" \
+      --end-time "$WIN_END" \
+      --resolution "$RESOLUTION" > "$tmp"
+    if [[ -f "$LAST_CALL_TIMED_OUT" ]]; then
+      consec=$((consec + 1))
+    else
+      consec=0
+    fi
+    jq -c --arg mk "$mkey" "$MQL_JQ" "$tmp" >> "$out" 2>/dev/null || true
+  done
+  rm -f "$tmp"
+  log_verb "$tag MQL metrics in $cname: $(wc -l < "$out" | tr -d ' ') datapoint(s) collected."
+}
+
+resolve_metrics_scope() {
+  case "$METRICS_SCOPE" in
+    auto|region|compartment) ;;
+    *) die "--metrics-scope must be one of: auto, region, compartment (got '$METRICS_SCOPE')." ;;
+  esac
+  EFF_METRICS_SCOPE="compartment"
+  if [[ "$METRICS_SCOPE" != "compartment" ]]; then
+    if [[ -n "$TENANCY_ID" && "$COMP_ID" == "$TENANCY_ID" ]]; then
+      EFF_METRICS_SCOPE="region"
+    elif [[ "$METRICS_SCOPE" == "region" ]]; then
+      log_warn "--metrics-scope region needs the scan root to be the tenancy OCID (OCI only allows compartmentIdInSubtree=true on the root compartment). Using per-compartment metric queries."
+    fi
+  fi
+}
+
 report_regions() {
   preflight_oci
   discover_regions
-  local r sfile n_inst n_comp
-  sfile="$TMP_WORK/report_search.txt"
+  pool_init
+  local i r n_inst n_comp t0="$SECONDS"
+  for i in "${!TARGET_REGIONS[@]}"; do
+    pool_run "search:${TARGET_REGIONS[$i]:-default}" task_search "${TARGET_REGIONS[$i]}" "$i"
+  done
+  pool_wait
   printf '\n%-24s %-12s %-14s\n' "REGION" "INSTANCES" "COMPARTMENTS" >&2
   printf '%-24s %-12s %-14s\n' "------------------------" "------------" "--------------" >&2
-  for r in "${TARGET_REGIONS[@]}"; do
-    if search_region_instances "$r" "$sfile"; then
-      n_inst="$(awk 'NF' "$sfile" | wc -l | tr -d ' ')"
-      n_comp="$(awk 'NF' "$sfile" | sort -u | wc -l | tr -d ' ')"
+  for i in "${!TARGET_REGIONS[@]}"; do
+    r="${TARGET_REGIONS[$i]}"
+    if [[ -f "$TMP_WORK/search_${i}.ok" ]]; then
+      n_inst="$(awk 'NF' "$TMP_WORK/search_${i}.txt" | wc -l | tr -d ' ')"
+      n_comp="$(awk 'NF' "$TMP_WORK/search_${i}.txt" | sort -u | wc -l | tr -d ' ')"
       printf '%-24s %-12s %-14s\n' "${r:-default}" "$n_inst" "$n_comp" >&2
     else
       printf '%-24s %-12s %-14s\n' "${r:-default}" "ERROR" "search failed" >&2
     fi
   done
-  CUR_REGION=""
   echo >&2
-  log_info "Tip: collect only specific regions with --regions sa-saopaulo-1,sa-vinhedo-1 (default: all subscribed regions)."
+  log_info "Region report finished in $((SECONDS - t0))s (parallel=$PARALLEL). Collect only specific regions with --regions sa-saopaulo-1,sa-vinhedo-1 (default: all subscribed regions)."
 }
 
 collect_oci() {
+  local t_total="$SECONDS" t_phase
   prompt_collect_type_if_needed
   preflight_oci
+  resolve_metrics_scope
 
-  log_info "Configuration: collect-type=$COLLECT_TYPE | regions=${REGIONS_ARG:-${REGION:-all}} | days=$DAYS | resolution=$RESOLUTION | conn-timeout=${CONN_TIMEOUT}s | read-timeout=${READ_TIMEOUT}s | cmd-timeout=${CMD_TIMEOUT}s | retries=$RETRIES"
+  local do_net_storage=1 do_metrics=1
+  case "$COLLECT_TYPE" in
+    full)         do_net_storage=1; do_metrics=1 ;;
+    inventory)    do_net_storage=1; do_metrics=0 ;;
+    compute-only) do_net_storage=0; do_metrics=0 ;;
+    metrics-only) do_net_storage=0; do_metrics=1 ;;
+  esac
+  local scope_label="n/a"
+  [[ "$do_metrics" -eq 1 ]] && scope_label="$EFF_METRICS_SCOPE"
 
-  mkdir -p "$RAW_DIR/by_compartment" "$RAW_DIR/by_image"
-  if [[ "$RESUME" -eq 0 && "$COLLECT_TYPE" != "metrics-only" ]]; then
-    rm -rf "$RAW_DIR/by_compartment" "$RAW_DIR/by_image" "$RAW_DIR/.done_compartments" "$RAW_DIR/errors.jsonl"
-    mkdir -p "$RAW_DIR/by_compartment" "$RAW_DIR/by_image"
+  log_info "Configuration: collect-type=$COLLECT_TYPE | regions=${REGIONS_ARG:-${REGION:-all}} | parallel=$PARALLEL | metrics-scope=$scope_label | days=$DAYS | resolution=$RESOLUTION | conn-timeout=${CONN_TIMEOUT}s | read-timeout=${READ_TIMEOUT}s | cmd-timeout=${CMD_TIMEOUT}s | retries=$RETRIES"
+
+  mkdir -p "$RAW_DIR"
+  if [[ "$RESUME" -eq 0 ]]; then
+    if [[ "$COLLECT_TYPE" != "metrics-only" ]]; then
+      rm -rf "$RAW_DIR/by_compartment" "$RAW_DIR/by_image" "$RAW_DIR/by_region" \
+        "$RAW_DIR/.done_compartments" "$RAW_DIR/.done_region_metrics" "$RAW_DIR/errors.jsonl"
+    else
+      rm -rf "$RAW_DIR/by_region" "$RAW_DIR/.done_region_metrics"
+    fi
   fi
-  touch "$RAW_DIR/.done_compartments" "$RAW_DIR/errors.jsonl"
+  mkdir -p "$RAW_DIR/by_compartment" "$RAW_DIR/by_image" "$RAW_DIR/by_region"
+  touch "$RAW_DIR/.done_compartments" "$RAW_DIR/.done_region_metrics" "$RAW_DIR/errors.jsonl"
 
-  local start_time end_time
-  end_time="$(ts_now)"
-  start_time="$(date -u -d "${DAYS} days ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-"${DAYS}"d +"%Y-%m-%dT%H:%M:%SZ")"
+  WIN_END="$(ts_now)"
+  WIN_START="$(date -u -d "${DAYS} days ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-"${DAYS}"d +"%Y-%m-%dT%H:%M:%SZ")"
+
+  MQL_SPECS=(
+    "cpu|oci_computeagent|CpuUtilization[${RESOLUTION}].groupBy(resourceId).mean()"
+    "mem|oci_computeagent|MemoryUtilization[${RESOLUTION}].groupBy(resourceId).mean()"
+    "disk_r|oci_computeagent|DiskIopsRead[${RESOLUTION}].groupBy(resourceId).rate()"
+    "disk_w|oci_computeagent|DiskIopsWritten[${RESOLUTION}].groupBy(resourceId).rate()"
+    "net_in|oci_computeagent|NetworksBytesIn[${RESOLUTION}].groupBy(resourceId).rate()"
+    "net_out|oci_computeagent|NetworksBytesOut[${RESOLUTION}].groupBy(resourceId).rate()"
+    "vol_r|oci_blockstore|VolumeReadOps[${RESOLUTION}].groupBy(resourceId).rate()"
+    "vol_w|oci_blockstore|VolumeWriteOps[${RESOLUTION}].groupBy(resourceId).rate()"
+  )
+  local all_keys="cpu,mem,disk_r,disk_w,net_in,net_out,vol_r,vol_w"
 
   local comp_names_file="$TMP_WORK/comp_names.tsv"
   : > "$comp_names_file"
   printf '%s\t%s\n' "$COMP_ID" "root" >> "$comp_names_file"
 
   discover_regions
+  pool_init
 
   # Compartments are global (IAM): discover once, then fan out per region.
-  local comp_list=()
+  local comp_list=() cid
   if [[ "$COLLECT_TYPE" == "metrics-only" ]]; then
     if [[ ! -s "$RAW_DIR/instances.jsonl" ]]; then
       die "--collect-type metrics-only requires an existing snapshot with instances in '$RAW_DIR/instances.jsonl'. Run '--collect-type inventory' first."
@@ -631,248 +850,286 @@ collect_oci() {
       done
     fi
     mapfile -t comp_list < <(printf '%s\n' "${comp_list[@]}" | awk 'NF && !seen[$0]++')
-    log_info "Found ${#comp_list[@]} active compartment(s) (window: $start_time -> $end_time, resolution: $RESOLUTION)."
+    log_info "Found ${#comp_list[@]} active compartment(s) (window: $WIN_START -> $WIN_END, resolution: $RESOLUTION)."
   fi
 
-  # Build the (region|compartment) work list.
+  # ---- Phase 1/4: build the (region|compartment) work list (regional OCI Search in parallel) ----
+  t_phase="$SECONDS"
   local work_file="$TMP_WORK/work_items.txt" comps_sorted="$TMP_WORK/comps_sorted.txt"
-  local sfile="$TMP_WORK/search_hits.txt" hits="$TMP_WORK/search_hits_in_scope.txt"
+  local hits="$TMP_WORK/search_hits_in_scope.txt"
   : > "$work_file"
   printf '%s\n' "${comp_list[@]}" | awk 'NF' | sort -u > "$comps_sorted"
-  local r rlabel n_hit
-  for r in "${TARGET_REGIONS[@]}"; do
-    rlabel="${r:-default}"
-    if [[ "$COLLECT_TYPE" == "metrics-only" ]]; then
+  local i r rlabel n_hit
+  if [[ "$COLLECT_TYPE" == "metrics-only" ]]; then
+    for r in "${TARGET_REGIONS[@]}"; do
+      rlabel="${r:-default}"
       jq -r --arg r "$r" --arg fb "$FALLBACK_REGION" '
         def rf: if . == null or . == "" then null elif . == "iad" then "us-ashburn-1" elif . == "phx" then "us-phoenix-1" else . end;
         select(((._oci_region // null) // (.region | rf) // $fb) == $r) | .["compartment-id"] // empty
       ' "$RAW_DIR/instances.jsonl" 2>/dev/null | awk 'NF' | sort -u | awk -v r="$r" '{ print r "|" $0 }' >> "$work_file"
       log_info "[region $rlabel] metrics-only: $(grep -c "^${r}|" "$work_file" || true) compartment(s) with VMs in snapshot."
-      continue
-    fi
-    if search_region_instances "$r" "$sfile"; then
-      awk 'NF' "$sfile" | sort -u | comm -12 - "$comps_sorted" > "$hits"
-      n_hit="$(wc -l < "$hits" | tr -d ' ')"
-      log_info "[region $rlabel] OCI Search: $(awk 'NF' "$sfile" | wc -l | tr -d ' ') instance(s) in $n_hit of ${#comp_list[@]} compartment(s) -> scanning only those."
-      awk -v r="$r" 'NF { print r "|" $0 }' "$hits" >> "$work_file"
-    else
-      log_warn "[region $rlabel] OCI Search unavailable; falling back to full scan of ${#comp_list[@]} compartment(s) in this region (slower)."
-      awk -v r="$r" 'NF { print r "|" $0 }' "$comps_sorted" >> "$work_file"
-    fi
-  done
-  CUR_REGION=""
-
-  local do_net_storage=1 do_metrics=1
-  case "$COLLECT_TYPE" in
-    full)         do_net_storage=1; do_metrics=1 ;;
-    inventory)    do_net_storage=1; do_metrics=0 ;;
-    compute-only) do_net_storage=0; do_metrics=0 ;;
-    metrics-only) do_net_storage=0; do_metrics=1 ;;
-  esac
-
-  local mql_specs=(
-    "cpu|oci_computeagent|CpuUtilization[${RESOLUTION}].groupBy(resourceId).mean()"
-    "mem|oci_computeagent|MemoryUtilization[${RESOLUTION}].groupBy(resourceId).mean()"
-    "disk_r|oci_computeagent|DiskIopsRead[${RESOLUTION}].groupBy(resourceId).rate()"
-    "disk_w|oci_computeagent|DiskIopsWritten[${RESOLUTION}].groupBy(resourceId).rate()"
-    "net_in|oci_computeagent|NetworksBytesIn[${RESOLUTION}].groupBy(resourceId).rate()"
-    "net_out|oci_computeagent|NetworksBytesOut[${RESOLUTION}].groupBy(resourceId).rate()"
-    "vol_r|oci_blockstore|VolumeReadOps[${RESOLUTION}].groupBy(resourceId).rate()"
-    "vol_w|oci_blockstore|VolumeWriteOps[${RESOLUTION}].groupBy(resourceId).rate()"
-  )
+    done
+  else
+    for i in "${!TARGET_REGIONS[@]}"; do
+      pool_run "search:${TARGET_REGIONS[$i]:-default}" task_search "${TARGET_REGIONS[$i]}" "$i"
+    done
+    pool_wait
+    for i in "${!TARGET_REGIONS[@]}"; do
+      r="${TARGET_REGIONS[$i]}"
+      rlabel="${r:-default}"
+      if [[ -f "$TMP_WORK/search_${i}.ok" ]]; then
+        awk 'NF' "$TMP_WORK/search_${i}.txt" | sort -u | comm -12 - "$comps_sorted" > "$hits"
+        n_hit="$(wc -l < "$hits" | tr -d ' ')"
+        log_info "[region $rlabel] OCI Search: $(awk 'NF' "$TMP_WORK/search_${i}.txt" | wc -l | tr -d ' ') instance(s) in $n_hit of ${#comp_list[@]} compartment(s) -> scanning only those."
+        awk -v r="$r" 'NF { print r "|" $0 }' "$hits" >> "$work_file"
+      else
+        log_warn "[region $rlabel] OCI Search unavailable; falling back to full scan of ${#comp_list[@]} compartment(s) in this region (slower)."
+        awk -v r="$r" 'NF { print r "|" $0 }' "$comps_sorted" >> "$work_file"
+      fi
+    done
+  fi
+  log_info "Phase 1/4 (work plan): ${#TARGET_REGIONS[@]} region(s) evaluated in $((SECONDS - t_phase))s (parallel=$PARALLEL)."
 
   local work_items=()
   mapfile -t work_items < "$work_file"
   local total_items="${#work_items[@]}"
-  local item_idx=0 comps_with_vms=0 item key tag
-  local cid cname chash cdir inst_json inst_count ad mspec mkey mns mquery mjson raw_json
 
-  log_info "Collection plan: $total_items (region|compartment) work item(s) across ${#TARGET_REGIONS[@]} region(s)."
-
-  for item in "${work_items[@]}"; do
-    item_idx=$((item_idx + 1))
+  # Per-item metadata (parallel arrays) for items that will be processed in this run.
+  local T_R=() T_CID=() T_CDIR=() T_TAG=() T_CNAME=() todo_keys=()
+  local item key cname chash cdir idx=0
+  local A_CDIR=() A_R=() A_CID=() A_CNAME=() A_TAG=()
+  for item in ${work_items[@]+"${work_items[@]}"}; do
+    idx=$((idx + 1))
     r="${item%%|*}"
     cid="${item#*|}"
     rlabel="${r:-default}"
     key="${r}|${cid}"
-    CUR_REGION="$r"
     cname="$(awk -F'\t' -v id="$cid" '$1 == id { print $2; exit }' "$comp_names_file" 2>/dev/null || true)"
     [[ -n "$cname" ]] || cname="compartment"
-    tag="[$item_idx/$total_items] [$rlabel]"
-
-    if [[ "$RESUME" -eq 1 ]] && grep -Fxq "$key" "$RAW_DIR/.done_compartments" 2>/dev/null; then
-      log_info "$tag Skipping already completed compartment (--resume): $cname ($cid)"
-      continue
-    fi
-
-    rm -f "$COMP_ERR_FLAG"
-    if [[ -s "$RAW_DIR/errors.jsonl" ]]; then
-      if jq -c --arg cid "$cid" --arg r "$r" 'select(.compartment_id != $cid or (.region // "") != $r)' "$RAW_DIR/errors.jsonl" > "$TMP_WORK/errors_filtered.jsonl" 2>/dev/null; then
-        mv "$TMP_WORK/errors_filtered.jsonl" "$RAW_DIR/errors.jsonl"
-      fi
-    fi
-
     chash="$(printf '%s' "$key" | sha256sum | cut -c1-16)"
     cdir="$RAW_DIR/by_compartment/${rlabel}/$chash"
+    A_CDIR+=("$cdir"); A_R+=("$r"); A_CID+=("$cid"); A_CNAME+=("$cname"); A_TAG+=("[$idx/$total_items] [$rlabel]")
+    if [[ "$RESUME" -eq 1 ]] && grep -Fxq "$key" "$RAW_DIR/.done_compartments" 2>/dev/null; then
+      log_info "[$idx/$total_items] [$rlabel] Skipping already completed compartment (--resume): $cname ($cid)"
+      continue
+    fi
+    T_R+=("$r"); T_CID+=("$cid"); T_CDIR+=("$cdir"); T_TAG+=("[$idx/$total_items] [$rlabel]"); T_CNAME+=("$cname")
+    todo_keys+=("$key")
+  done
+  local n_todo="${#T_CID[@]}"
 
+  # Drop stale per-compartment errors for items about to be re-collected (done once, not per task).
+  if [[ -s "$RAW_DIR/errors.jsonl" && "$n_todo" -gt 0 ]]; then
+    printf '%s\n' "${todo_keys[@]}" | jq -R -n '[inputs | {key: ., value: true}] | from_entries' > "$TMP_WORK/todo_keys.json" 2>/dev/null || printf '{}\n' > "$TMP_WORK/todo_keys.json"
+    if jq -c --slurpfile k "$TMP_WORK/todo_keys.json" '
+        select(((.step // "") | startswith("monitoring:region:")) or
+               (($k[0][((.region // "") + "|" + (.compartment_id // ""))] // false) | not))
+      ' "$RAW_DIR/errors.jsonl" > "$TMP_WORK/errors_filtered.jsonl" 2>/dev/null; then
+      mv "$TMP_WORK/errors_filtered.jsonl" "$RAW_DIR/errors.jsonl"
+    fi
+  fi
+
+  log_info "Collection plan: $n_todo of $total_items (region|compartment) work item(s) to process across ${#TARGET_REGIONS[@]} region(s) with up to $PARALLEL concurrent OCI CLI calls."
+
+  # ---- Phase 2/4: instance discovery (parallel, one task per compartment) ----
+  t_phase="$SECONDS"
+  for ((i = 0; i < n_todo; i++)); do
+    cdir="${T_CDIR[$i]}"
     if [[ "$COLLECT_TYPE" == "metrics-only" ]]; then
       mkdir -p "$cdir"
+      rm -f "$cdir"/.err_* "$cdir/metrics.jsonl" "$cdir/metrics_fallback.jsonl"
       if [[ ! -s "$cdir/instances.jsonl" ]]; then
-        jq -c --arg cid "$cid" --arg r "$r" --arg fb "$FALLBACK_REGION" '
+        jq -c --arg cid "${T_CID[$i]}" --arg r "${T_R[$i]}" --arg fb "$FALLBACK_REGION" '
           def rf: if . == null or . == "" then null elif . == "iad" then "us-ashburn-1" elif . == "phx" then "us-phoenix-1" else . end;
           select(.["compartment-id"] == $cid and (((._oci_region // null) // (.region | rf) // $fb) == $r))
         ' "$RAW_DIR/instances.jsonl" > "$cdir/instances.jsonl" 2>/dev/null || true
       fi
-      inst_count="$(wc -l < "$cdir/instances.jsonl" | tr -d ' ')"
-      log_info "$tag Collecting MQL metrics for compartment: $cname ($cid) [$inst_count existing VM(s)]"
+      log_info "${T_TAG[$i]} Collecting MQL metrics for compartment: ${T_CNAME[$i]} (${T_CID[$i]}) [$(wc -l < "$cdir/instances.jsonl" | tr -d ' ') existing VM(s)]"
     else
       rm -rf "$cdir"
       mkdir -p "$cdir"
-      log_info "$tag Collecting compartment: $cname ($cid)"
-
-      inst_json="$(run_oci "compute:instance-list" "$cid" NONFATAL compute instance list --compartment-id "$cid" --all)"
-      printf '%s\n' "$inst_json" | jq -c --arg r "$r" '.data[]? | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | . + {"_oci_region": $r}' > "$cdir/instances.jsonl" 2>/dev/null || : > "$cdir/instances.jsonl"
-      inst_count="$(wc -l < "$cdir/instances.jsonl" | tr -d ' ')"
+      log_info "${T_TAG[$i]} Collecting compartment: ${T_CNAME[$i]} (${T_CID[$i]})"
+      pool_run "instances:${T_CID[$i]}" task_instances "${T_R[$i]}" "${T_CID[$i]}" "$cdir"
     fi
+  done
+  pool_wait
+  [[ "$COLLECT_TYPE" == "metrics-only" ]] || log_info "Phase 2/4 (instance discovery): $n_todo compartment(s) in $((SECONDS - t_phase))s (parallel=$PARALLEL)."
 
+  # Regions that contain VMs (considering previously completed items too, for --resume).
+  declare -A region_has_vms=()
+  for ((i = 0; i < ${#A_CDIR[@]}; i++)); do
+    if [[ -s "${A_CDIR[$i]}/instances.jsonl" ]]; then
+      region_has_vms["${A_R[$i]:-__default__}"]=1
+    fi
+  done
+
+  # ---- Phase 3/4: attached resources, OS images and metrics (parallel, one task per OCI call) ----
+  t_phase="$SECONDS"
+  local n_tasks=0 inst_count ad ahash
+  for ((i = 0; i < n_todo; i++)); do
+    cdir="${T_CDIR[$i]}"
+    r="${T_R[$i]}"
+    cid="${T_CID[$i]}"
+    inst_count="$(wc -l < "$cdir/instances.jsonl" 2>/dev/null | tr -d ' ' || echo 0)"
+    [[ -n "$inst_count" ]] || inst_count=0
     if [[ "$inst_count" -gt 0 ]]; then
-      comps_with_vms=$((comps_with_vms + 1))
-      log_verb "$tag Found $inst_count active VM(s) in $cname. Collecting attached resources (collect-type=$COLLECT_TYPE)..."
-
+      log_verb "${T_TAG[$i]} Found $inst_count active VM(s) in ${T_CNAME[$i]}. Queuing attached-resource tasks (collect-type=$COLLECT_TYPE)..."
       if [[ "$do_net_storage" -eq 1 ]]; then
-        raw_json="$(run_oci "compute:vnic-attachment-list" "$cid" NONFATAL compute vnic-attachment list --compartment-id "$cid" --all)"
-        printf '%s\n' "$raw_json" | jq -c '.data[]?' > "$cdir/vnic_attachments.jsonl" 2>/dev/null || : > "$cdir/vnic_attachments.jsonl"
-
-        raw_json="$(run_oci "compute:instance-list-vnics" "$cid" NONFATAL compute instance list-vnics --compartment-id "$cid" --all)"
-        printf '%s\n' "$raw_json" | jq -c '.data[]?' > "$cdir/vnics.jsonl" 2>/dev/null || : > "$cdir/vnics.jsonl"
-
-        raw_json="$(run_oci "compute:volume-attachment-list" "$cid" NONFATAL compute volume-attachment list --compartment-id "$cid" --all)"
-        printf '%s\n' "$raw_json" | jq -c '.data[]?' > "$cdir/volume_attachments.jsonl" 2>/dev/null || : > "$cdir/volume_attachments.jsonl"
-
-        raw_json="$(run_oci "bv:volume-list" "$cid" NONFATAL bv volume list --compartment-id "$cid" --all)"
-        printf '%s\n' "$raw_json" | jq -c '.data[]?' > "$cdir/volumes.jsonl" 2>/dev/null || : > "$cdir/volumes.jsonl"
-
-        : > "$cdir/boot_volume_attachments.jsonl"
-        : > "$cdir/boot_volumes.jsonl"
+        pool_run "vnic-att:$cid" task_list "$r" "$cid" "compute:vnic-attachment-list" "$cdir/vnic_attachments.jsonl" "$cdir/.err_vnic_att" \
+          compute vnic-attachment list --compartment-id "$cid" --all
+        pool_run "vnics:$cid" task_list "$r" "$cid" "compute:instance-list-vnics" "$cdir/vnics.jsonl" "$cdir/.err_vnics" \
+          compute instance list-vnics --compartment-id "$cid" --all
+        pool_run "vol-att:$cid" task_list "$r" "$cid" "compute:volume-attachment-list" "$cdir/volume_attachments.jsonl" "$cdir/.err_vol_att" \
+          compute volume-attachment list --compartment-id "$cid" --all
+        pool_run "volumes:$cid" task_list "$r" "$cid" "bv:volume-list" "$cdir/volumes.jsonl" "$cdir/.err_volumes" \
+          bv volume list --compartment-id "$cid" --all
+        n_tasks=$((n_tasks + 4))
         while IFS= read -r ad; do
           [[ -n "$ad" ]] || continue
-          raw_json="$(run_oci "compute:boot-volume-attachment-list:$ad" "$cid" NONFATAL \
-            compute boot-volume-attachment list --compartment-id "$cid" --availability-domain "$ad" --all)"
-          printf '%s\n' "$raw_json" | jq -c '.data[]?' >> "$cdir/boot_volume_attachments.jsonl" 2>/dev/null || true
-
-          raw_json="$(run_oci "bv:boot-volume-list:$ad" "$cid" NONFATAL \
-            bv boot-volume list --compartment-id "$cid" --availability-domain "$ad" --all)"
-          printf '%s\n' "$raw_json" | jq -c '.data[]?' >> "$cdir/boot_volumes.jsonl" 2>/dev/null || true
+          ahash="$(printf '%s' "$ad" | sha256sum | cut -c1-12)"
+          pool_run "boot-att:$cid:$ad" task_list "$r" "$cid" "compute:boot-volume-attachment-list:$ad" "$cdir/.part_bva_${ahash}.jsonl" "$cdir/.err_bva_${ahash}" \
+            compute boot-volume-attachment list --compartment-id "$cid" --availability-domain "$ad" --all
+          pool_run "boot-vol:$cid:$ad" task_list "$r" "$cid" "bv:boot-volume-list:$ad" "$cdir/.part_bv_${ahash}.jsonl" "$cdir/.err_bv_${ahash}" \
+            bv boot-volume list --compartment-id "$cid" --availability-domain "$ad" --all
+          n_tasks=$((n_tasks + 2))
         done < <(jq -r '.["availability-domain"] // empty' "$cdir/instances.jsonl" 2>/dev/null | sort -u)
-
-        log_verb "$tag Storage & Network in $cname: vnics=$(wc -l < "$cdir/vnics.jsonl" | tr -d ' '), boot_vols=$(wc -l < "$cdir/boot_volumes.jsonl" | tr -d ' '), block_vols=$(wc -l < "$cdir/volumes.jsonl" | tr -d ' ')."
-      elif [[ "$COLLECT_TYPE" != "metrics-only" ]]; then
-        for empty_f in vnic_attachments vnics volume_attachments volumes boot_volume_attachments boot_volumes; do
-          : > "$cdir/${empty_f}.jsonl"
-        done
       fi
-
-      if [[ "$do_metrics" -eq 1 ]]; then
-        : > "$cdir/metrics.jsonl"
-        local consec_metric_timeouts=0
-        for mspec in "${mql_specs[@]}"; do
-          IFS='|' read -r mkey mns mquery <<< "$mspec"
-          if [[ "$MAX_METRIC_TIMEOUTS" -gt 0 && "$consec_metric_timeouts" -ge "$MAX_METRIC_TIMEOUTS" ]]; then
-            log_warn "$tag Circuit breaker active: skipping 'monitoring:${mkey}' in $cname after $consec_metric_timeouts consecutive MQL timeouts."
-            echo "1" > "$COMP_ERR_FLAG"
-            record_oci_error "monitoring:${mkey}" "$cid" 124 0 "CIRCUIT_BREAKER_SKIPPED_AFTER_TIMEOUTS" "Skipped after $consec_metric_timeouts consecutive MQL timeouts in compartment"
-            continue
-          fi
-
-          log_verb "$tag Querying MQL metric '${mkey}' ($mns) for $cname..."
-          mjson="$(run_oci "monitoring:${mkey}" "$cid" NONFATAL \
-            monitoring metric-data summarize-metrics-data \
-            --compartment-id "$cid" \
-            --namespace "$mns" \
-            --query-text "$mquery" \
-            --start-time "$start_time" \
-            --end-time "$end_time" \
-            --resolution "$RESOLUTION")"
-
-          if [[ -f "$LAST_CALL_TIMED_OUT" ]]; then
-            consec_metric_timeouts=$((consec_metric_timeouts + 1))
-          else
-            consec_metric_timeouts=0
-          fi
-
-          printf '%s\n' "$mjson" | jq -c --arg mk "$mkey" '
-            .data[]? |
-            ((.dimensions.resourceId // .dimensions.RESOURCEID // "") | tostring) as $rid |
-            select($rid != "") |
-            (.["aggregated-datapoints"] // [])[] |
-            select(.value != null and .timestamp != null) |
-            {metric_key: $mk, resource_id: $rid, timestamp: .timestamp, value: .value}
-          ' >> "$cdir/metrics.jsonl" 2>/dev/null || true
-        done
-        log_verb "$tag MQL metrics in $cname: $(wc -l < "$cdir/metrics.jsonl" | tr -d ' ') datapoint(s) collected."
-      else
-        : > "$cdir/metrics.jsonl"
+      if [[ "$do_metrics" -eq 1 && "$EFF_METRICS_SCOPE" == "compartment" ]]; then
+        pool_run "metrics:$cid" task_comp_metrics "$r" "$cid" "$cdir" "${T_CNAME[$i]}" "${T_TAG[$i]}" "$all_keys" "$cdir/metrics.jsonl" "$cdir/.err_metrics"
+        n_tasks=$((n_tasks + 1))
       fi
     else
-      log_verb "$tag 0 active VMs in $cname (skipping VNIC, volume, and metric queries)."
-      for empty_f in vnic_attachments vnics volume_attachments volumes boot_volume_attachments boot_volumes metrics; do
-        [[ -f "$cdir/${empty_f}.jsonl" ]] || : > "$cdir/${empty_f}.jsonl"
+      log_verb "${T_TAG[$i]} 0 active VMs in ${T_CNAME[$i]} (skipping VNIC, volume, and metric queries)."
+    fi
+  done
+
+  # Tenancy-wide metrics: 8 MQL calls per region instead of 8 per compartment.
+  local region_metric_runs=() spec rdir
+  if [[ "$do_metrics" -eq 1 && "$EFF_METRICS_SCOPE" == "region" ]]; then
+    for r in "${TARGET_REGIONS[@]}"; do
+      [[ -n "${region_has_vms[${r:-__default__}]:-}" ]] || continue
+      if [[ "$RESUME" -eq 1 ]] && grep -Fxq "region|${r}" "$RAW_DIR/.done_region_metrics" 2>/dev/null; then
+        log_info "[region ${r:-default}] Skipping tenancy-wide metrics already completed (--resume)."
+        continue
+      fi
+      region_metric_runs+=("$r")
+      if [[ -s "$RAW_DIR/errors.jsonl" ]]; then
+        if jq -c --arg r "$r" 'select((((.step // "") | startswith("monitoring:region:")) and ((.region // "") == $r)) | not)' \
+            "$RAW_DIR/errors.jsonl" > "$TMP_WORK/errors_filtered.jsonl" 2>/dev/null; then
+          mv "$TMP_WORK/errors_filtered.jsonl" "$RAW_DIR/errors.jsonl"
+        fi
+      fi
+      rdir="$RAW_DIR/by_region/${r:-default}"
+      rm -rf "$rdir"
+      mkdir -p "$rdir"
+      for spec in "${MQL_SPECS[@]}"; do
+        pool_run "region-metric:${r:-default}:${spec%%|*}" task_region_metric "$r" "$spec" "$rdir"
+        n_tasks=$((n_tasks + 1))
       done
-    fi
-
-    if [[ ! -f "$COMP_ERR_FLAG" ]]; then
-      if ! grep -Fxq "$key" "$RAW_DIR/.done_compartments" 2>/dev/null; then
-        printf '%s\n' "$key" >> "$RAW_DIR/.done_compartments"
-      fi
-    else
-      log_warn "$tag Compartment $cname ($cid) experienced isolated timeout/errors; left unmarked for '--resume' retry. Moving on..."
-    fi
-  done
-  CUR_REGION=""
-
-  for stream in instances vnic_attachments vnics volume_attachments volumes boot_volume_attachments boot_volumes metrics; do
-    if [[ "$COLLECT_TYPE" == "metrics-only" && "$stream" != "metrics" && -s "$RAW_DIR/${stream}.jsonl" ]]; then
-      continue
-    fi
-    : > "$RAW_DIR/${stream}.jsonl"
-    for f in "$RAW_DIR"/by_compartment/*/*/"${stream}.jsonl"; do
-      if [[ -f "$f" ]]; then
-        cat "$f" >> "$RAW_DIR/${stream}.jsonl"
-      fi
     done
-  done
+  fi
 
+  # OS image metadata (deduplicated per region, cached across runs).
   if [[ "$COLLECT_TYPE" != "metrics-only" ]]; then
-    : > "$RAW_DIR/images.jsonl"
-    local img_pair img_r img_id ihash img_file img_json
+    local img_pair img_r img_id ihash img_file
     while IFS= read -r img_pair; do
       img_r="${img_pair%%|*}"
       img_id="${img_pair#*|}"
       [[ -n "$img_id" ]] || continue
       ihash="$(printf '%s|%s' "$img_r" "$img_id" | sha256sum | cut -c1-16)"
       img_file="$RAW_DIR/by_image/${ihash}.json"
-      if [[ ! -s "$img_file" ]]; then
-        rm -f "$COMP_ERR_FLAG"
-        CUR_REGION="$img_r"
-        log_verb "[${img_r:-default}] Inspecting OS image metadata: $img_id"
-        img_json="$(run_oci "compute:image-get" "$img_id" NONFATAL compute image get --image-id "$img_id")"
-        if [[ ! -f "$COMP_ERR_FLAG" ]]; then
-          printf '%s\n' "$img_json" | jq -c '.data | select(type == "object" and (.id // "") != "")' > "$img_file" 2>/dev/null || rm -f "$img_file"
-        fi
-      fi
-      if [[ -s "$img_file" ]]; then
-        cat "$img_file" >> "$RAW_DIR/images.jsonl"
-      fi
+      [[ -s "$img_file" ]] && continue
+      pool_run "image:$img_id" task_image "$img_r" "$img_id" "$img_file"
+      n_tasks=$((n_tasks + 1))
+    done < <(for ((i = 0; i < ${#A_CDIR[@]}; i++)); do [[ -s "${A_CDIR[$i]}/instances.jsonl" ]] && cat "${A_CDIR[$i]}/instances.jsonl"; done \
+             | jq -r '"\(._oci_region // "")|\(.["image-id"] // "")"' 2>/dev/null | sort -u)
+  fi
+  pool_wait
+  log_info "Phase 3/4 (attached resources, images & metrics): $n_tasks OCI CLI task(s) in $((SECONDS - t_phase))s (parallel=$PARALLEL)."
+
+  # ---- Phase 4/4: fallback to per-compartment metrics where a tenancy-wide query failed ----
+  t_phase="$SECONDS"
+  local n_fb=0 failed_keys mkey
+  for r in ${region_metric_runs[@]+"${region_metric_runs[@]}"}; do
+    rdir="$RAW_DIR/by_region/${r:-default}"
+    failed_keys=""
+    for spec in "${MQL_SPECS[@]}"; do
+      mkey="${spec%%|*}"
+      [[ -f "$rdir/.err_${mkey}" ]] && failed_keys="${failed_keys:+$failed_keys,}$mkey"
+    done
+    [[ -n "$failed_keys" ]] || continue
+    log_warn "[region ${r:-default}] Tenancy-wide MQL query failed for [$failed_keys] (e.g. response too large or not permitted at root). Falling back to per-compartment queries for those metrics."
+    for ((i = 0; i < ${#A_CDIR[@]}; i++)); do
+      [[ "${A_R[$i]}" == "$r" && -s "${A_CDIR[$i]}/instances.jsonl" ]] || continue
+      pool_run "metrics-fallback:${A_CID[$i]}" task_comp_metrics "$r" "${A_CID[$i]}" "${A_CDIR[$i]}" "${A_CNAME[$i]}" "${A_TAG[$i]}" \
+        "$failed_keys" "${A_CDIR[$i]}/metrics_fallback.jsonl" "${A_CDIR[$i]}/.err_metrics_fallback"
+      n_fb=$((n_fb + 1))
+    done
+  done
+  pool_wait
+  [[ "$n_fb" -gt 0 ]] && log_info "Phase 4/4 (metrics fallback): $n_fb per-compartment task(s) in $((SECONDS - t_phase))s (parallel=$PARALLEL)."
+
+  # ---- Finalize: merge per-AD parts, write checkpoints (sequential, deterministic order) ----
+  local stream_f
+  for ((i = 0; i < n_todo; i++)); do
+    cdir="${T_CDIR[$i]}"
+    if compgen -G "$cdir/.part_bva_*.jsonl" > /dev/null; then
+      cat "$cdir"/.part_bva_*.jsonl > "$cdir/boot_volume_attachments.jsonl"
+      rm -f "$cdir"/.part_bva_*.jsonl
+    fi
+    if compgen -G "$cdir/.part_bv_*.jsonl" > /dev/null; then
+      cat "$cdir"/.part_bv_*.jsonl > "$cdir/boot_volumes.jsonl"
+      rm -f "$cdir"/.part_bv_*.jsonl
+    fi
+    for stream_f in instances vnic_attachments vnics volume_attachments volumes boot_volume_attachments boot_volumes metrics; do
+      [[ -f "$cdir/${stream_f}.jsonl" ]] || : > "$cdir/${stream_f}.jsonl"
+    done
+    if compgen -G "$cdir/.err_*" > /dev/null; then
+      log_warn "${T_TAG[$i]} Compartment ${T_CNAME[$i]} (${T_CID[$i]}) had isolated timeout/errors; left unmarked for '--resume' retry."
+    elif ! grep -Fxq "${T_R[$i]}|${T_CID[$i]}" "$RAW_DIR/.done_compartments" 2>/dev/null; then
+      printf '%s\n' "${T_R[$i]}|${T_CID[$i]}" >> "$RAW_DIR/.done_compartments"
+    fi
+  done
+  for r in ${region_metric_runs[@]+"${region_metric_runs[@]}"}; do
+    rdir="$RAW_DIR/by_region/${r:-default}"
+    if ! compgen -G "$rdir/.err_*" > /dev/null; then
+      printf '%s\n' "region|${r}" >> "$RAW_DIR/.done_region_metrics"
+    fi
+  done
+
+  for stream_f in instances vnic_attachments vnics volume_attachments volumes boot_volume_attachments boot_volumes metrics; do
+    if [[ "$COLLECT_TYPE" == "metrics-only" && "$stream_f" != "metrics" && -s "$RAW_DIR/${stream_f}.jsonl" ]]; then
+      continue
+    fi
+    : > "$RAW_DIR/${stream_f}.jsonl"
+    for f in "$RAW_DIR"/by_compartment/*/*/"${stream_f}.jsonl"; do
+      [[ -f "$f" ]] && cat "$f" >> "$RAW_DIR/${stream_f}.jsonl"
+    done
+  done
+  for f in "$RAW_DIR"/by_compartment/*/*/metrics_fallback.jsonl "$RAW_DIR"/by_region/*/metrics_*.jsonl; do
+    [[ -f "$f" ]] && cat "$f" >> "$RAW_DIR/metrics.jsonl"
+  done
+
+  if [[ "$COLLECT_TYPE" != "metrics-only" ]]; then
+    : > "$RAW_DIR/images.jsonl"
+    local img_pair2 ihash2
+    while IFS= read -r img_pair2; do
+      [[ -n "${img_pair2#*|}" ]] || continue
+      ihash2="$(printf '%s' "$img_pair2" | sha256sum | cut -c1-16)"
+      [[ -s "$RAW_DIR/by_image/${ihash2}.json" ]] && cat "$RAW_DIR/by_image/${ihash2}.json" >> "$RAW_DIR/images.jsonl"
     done < <(jq -r '"\(._oci_region // "")|\(.["image-id"] // "")"' "$RAW_DIR/instances.jsonl" 2>/dev/null | sort -u)
-    CUR_REGION=""
   fi
 
-  local total_vms total_errs total_metrics regions_json per_region
+  local total_vms total_errs total_metrics regions_json per_region comps_with_vms=0 elapsed
+  for ((i = 0; i < ${#A_CDIR[@]}; i++)); do
+    [[ -s "${A_CDIR[$i]}/instances.jsonl" ]] && comps_with_vms=$((comps_with_vms + 1))
+  done
   total_vms="$(jq -s 'unique_by(.id) | length' "$RAW_DIR/instances.jsonl" 2>/dev/null || echo 0)"
   total_metrics="$(wc -l < "$RAW_DIR/metrics.jsonl" 2>/dev/null | tr -d ' ' || echo 0)"
   total_errs="$(wc -l < "$RAW_DIR/errors.jsonl" 2>/dev/null | tr -d ' ' || echo 0)"
   regions_json="$(printf '%s\n' "${TARGET_REGIONS[@]}" | jq -R . | jq -s -c . 2>/dev/null || echo '[]')"
   per_region="$(jq -s -c 'unique_by(.id) | group_by(._oci_region // "default") | map({key: (.[0]._oci_region // "default"), value: length}) | from_entries' "$RAW_DIR/instances.jsonl" 2>/dev/null || echo '{}')"
+  elapsed=$((SECONDS - t_total))
 
   jq -n \
     --arg generated_at "$(ts_now)" \
@@ -881,22 +1138,26 @@ collect_oci() {
     --arg region "${FALLBACK_REGION}" \
     --argjson regions "$regions_json" \
     --argjson instances_by_region "$per_region" \
-    --arg start_time "$start_time" \
-    --arg end_time "$end_time" \
+    --arg start_time "$WIN_START" \
+    --arg end_time "$WIN_END" \
     --arg resolution "$RESOLUTION" \
+    --arg metrics_scope "$scope_label" \
+    --argjson parallel "$PARALLEL" \
+    --argjson elapsed "$elapsed" \
     --argjson work_items "$total_items" \
     --argjson compartments_with_vms "$comps_with_vms" \
     --argjson instances_collected "$total_vms" \
     --argjson metric_datapoints "$total_metrics" \
     --argjson errors_recorded "$total_errs" \
     '{
-      schema_version: "1.2",
+      schema_version: "1.3",
       generated_at: $generated_at,
       collect_type: $collect_type,
       root_compartment: $root_compartment,
       default_region: $region,
       regions: $regions,
       window: {start_time: $start_time, end_time: $end_time, resolution: $resolution},
+      execution: {parallel: $parallel, metrics_scope: $metrics_scope, elapsed_seconds: $elapsed},
       counts: {
         region_compartment_items: $work_items,
         compartments_with_vms: $compartments_with_vms,
@@ -907,7 +1168,7 @@ collect_oci() {
       }
     }' > "$RAW_DIR/manifest.json"
 
-  log_info "Milestone 1 ($COLLECT_TYPE) complete: $total_vms instance(s) across ${#TARGET_REGIONS[@]} region(s) $per_region, $total_metrics metric datapoint(s) saved in '$RAW_DIR' (isolated CLI errors/timeouts: $total_errs)."
+  log_info "Milestone 1 ($COLLECT_TYPE) complete in ${elapsed}s: $total_vms instance(s) across ${#TARGET_REGIONS[@]} region(s) $per_region, $total_metrics metric datapoint(s) saved in '$RAW_DIR' (isolated CLI errors/timeouts: $total_errs)."
   if [[ "$total_vms" -eq 0 ]]; then
     log_warn "0 instances found in region(s): ${TARGET_REGIONS[*]:-default}. Run './oci_to_mc.sh regions' to list subscribed regions and instance counts, then pass '--regions <r1,r2>'."
   fi
@@ -1238,6 +1499,7 @@ def build_context($default_loc; $do_anon):
   };
 JQ_EOF
 
+  local export_pids=() export_t0="$SECONDS" epid
   # 1. vmInfo.csv
   log_verb "Generating $OUT_DIR/vmInfo.csv..."
   {
@@ -1284,7 +1546,8 @@ JQ_EOF
         (if ($shape | startswith("BM.")) then 1 else 0 end)
       ] | @csv
     ' -L "$TMP_WORK" "$TMP_WORK/bundle.json"
-  } > "$OUT_DIR/vmInfo.csv"
+  } > "$OUT_DIR/vmInfo.csv" &
+  export_pids+=($!)
 
   # 2. diskInfo.csv
   log_verb "Generating $OUT_DIR/diskInfo.csv..."
@@ -1305,7 +1568,8 @@ JQ_EOF
         .tier
       ] | @csv
     ' -L "$TMP_WORK" "$TMP_WORK/bundle.json"
-  } > "$OUT_DIR/diskInfo.csv"
+  } > "$OUT_DIR/diskInfo.csv" &
+  export_pids+=($!)
 
   # 3. perfInfo.csv (empirical MQL series + attached blockstore IOPS fallback; empty cell for missing metrics)
   log_verb "Generating $OUT_DIR/perfInfo.csv..."
@@ -1348,7 +1612,8 @@ JQ_EOF
         (($p.net_in // null) | clamp_nonneg)
       ] | @csv
     ' -L "$TMP_WORK" "$TMP_WORK/bundle.json"
-  } > "$OUT_DIR/perfInfo.csv"
+  } > "$OUT_DIR/perfInfo.csv" &
+  export_pids+=($!)
 
   # 4. tagInfo.csv
   log_verb "Generating $OUT_DIR/tagInfo.csv..."
@@ -1382,7 +1647,13 @@ JQ_EOF
       select(.k != "" and .v != "") |
       [$mid, .k, .v] | @csv
     ' -L "$TMP_WORK" "$TMP_WORK/bundle.json"
-  } > "$OUT_DIR/tagInfo.csv"
+  } > "$OUT_DIR/tagInfo.csv" &
+  export_pids+=($!)
+
+  for epid in "${export_pids[@]}"; do
+    wait "$epid" || die "CSV generation failed (jq exited with an error). Re-run with -v for details."
+  done
+  log_verb "Generated 4 CSVs concurrently in $((SECONDS - export_t0))s."
 
   local max_b
   if [[ -n "$MAX_BYTES" ]]; then
