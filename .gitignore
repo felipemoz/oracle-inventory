@@ -1,0 +1,5 @@
+oci_raw_snapshot/
+mc_export_csv/
+*.log
+*.out
+.DS_Store
