@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # OCI CLI -> Google Cloud Migration Center Exporter (2 Decoupled Milestones)
-#   Milestone 1 (collect): Runs read-only OCI CLI commands with preflight config
+#   Milestone 1 (collect): Runs read-only OCI CLI commands across ALL subscribed
+#                          OCI regions (or --regions list) with preflight config
 #                          verification, selectable collection type (full,
 #                          inventory, compute-only, metrics-only), verbose
 #                          step-by-step telemetry, 4-layer timeout/retry
@@ -25,6 +26,10 @@ fi
 
 COMP_ID=""
 REGION=""
+REGIONS_ARG=""
+CUR_REGION=""
+TENANCY_ID=""
+TARGET_REGIONS=()
 AUTH_MODE=""
 CONFIG_FILE="${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}"
 PROFILE="${OCI_CLI_PROFILE:-DEFAULT}"
@@ -51,11 +56,12 @@ FALLBACK_REGION=""
 usage() {
   cat <<'EOF'
 Usage:
-  ./oci_to_mc.sh [run|preflight|collect|export] [options]
+  ./oci_to_mc.sh [run|preflight|regions|collect|export] [options]
 
 Modes:
   run         Run preflight + Milestone 1 (collect) + Milestone 2 (export) [default]
   preflight   Verify OCI CLI installation, config/key files, auth mode, and IAM read access
+  regions     List subscribed OCI regions with instance/compartment counts (via OCI Search)
   collect     Milestone 1: Extract OCI inventory & MQL metrics via OCI CLI into JSONL snapshot
   export      Milestone 2: Offline conversion of JSONL snapshot into Migration Center CSVs
 
@@ -70,7 +76,8 @@ Options:
   -t, --collect-type <TYPE>      Collection scope: full | inventory | compute-only | metrics-only (or 1|2|3|4)
   -v, --verbose                  Verbose mode with full OCI CLI command trace and elapsed timers
   -q, --quiet                    Quiet mode (only summary and error messages)
-  --region <REGION>              Target OCI region override (e.g. sa-saopaulo-1)
+  --regions <all|r1,r2,...>      Regions to collect (default: all subscribed regions), e.g. sa-saopaulo-1,sa-vinhedo-1
+  --region <REGION>              Single-region shortcut (same as --regions <REGION>)
   --auth <MODE>                  api_key | security_token | instance_obo_user | instance_principal | resource_principal
   --config-file <PATH>           OCI CLI config path (default: ~/.oci/config or $OCI_CLI_CONFIG_FILE)
   --profile <NAME>               OCI CLI config profile (default: DEFAULT or $OCI_CLI_PROFILE)
@@ -100,6 +107,7 @@ while [[ $# -gt 0 ]]; do
     -v|--verbose)             VERBOSE=1; TRACE_CMDS=1; shift ;;
     -q|--quiet)               VERBOSE=0; TRACE_CMDS=0; shift ;;
     --region)                 REGION="${2:-}"; shift 2 ;;
+    --regions)                REGIONS_ARG="${2:-}"; shift 2 ;;
     --auth)                   AUTH_MODE="${2:-}"; shift 2 ;;
     --config-file)            CONFIG_FILE="${2:-}"; shift 2 ;;
     --profile)                PROFILE="${2:-}"; shift 2 ;;
@@ -124,8 +132,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MODE" in
-  run|preflight|collect|export) ;;
-  *) echo "[FATAL] Invalid mode '$MODE'. Expected: run | preflight | collect | export" >&2; exit 2 ;;
+  run|preflight|regions|collect|export) ;;
+  *) echo "[FATAL] Invalid mode '$MODE'. Expected: run | preflight | regions | collect | export" >&2; exit 2 ;;
 esac
 
 TMP_WORK="$(mktemp -d)"
@@ -268,7 +276,8 @@ record_oci_error() {
     --argjson attempts "${attempts:-1}" \
     --arg reason "$reason" \
     --arg stderr "$clean_err" \
-    '{timestamp:$ts, compartment_id:$cid, step:$step, exit_code:$rc, attempts:$attempts, reason:$reason, stderr:$stderr}' \
+    --arg region "${CUR_REGION:-$REGION}" \
+    '{timestamp:$ts, region:$region, compartment_id:$cid, step:$step, exit_code:$rc, attempts:$attempts, reason:$reason, stderr:$stderr}' \
     >> "$RAW_DIR/errors.jsonl" 2>/dev/null || true
 }
 
@@ -293,8 +302,9 @@ run_oci() {
   if [[ "$AUTH_MODE" == "api_key" || "$AUTH_MODE" == "security_token" ]]; then
     oci_args+=(--config-file "$CONFIG_FILE" --profile "$PROFILE")
   fi
-  if [[ -n "$REGION" ]]; then
-    oci_args+=(--region "$REGION")
+  local eff_region="${CUR_REGION:-$REGION}"
+  if [[ -n "$eff_region" ]]; then
+    oci_args+=(--region "$eff_region")
   fi
 
   local out_tmp="$TMP_WORK/oci_out_${BASHPID:-$$}_${RANDOM}.json"
@@ -305,7 +315,7 @@ run_oci() {
     : > "$out_tmp"
     : > "$err_tmp"
     t0="$SECONDS"
-    log_cmd "Executing [$step] (attempt $attempt/$RETRIES, cmd-timeout=${CMD_TIMEOUT}s, read-timeout=${READ_TIMEOUT}s): oci ${oci_args[*]} $*"
+    log_cmd "Executing [$step] [region=${eff_region:-default}] (attempt $attempt/$RETRIES, cmd-timeout=${CMD_TIMEOUT}s, read-timeout=${READ_TIMEOUT}s): oci ${oci_args[*]} $*"
 
     set +e
     OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True \
@@ -448,6 +458,7 @@ preflight_oci() {
           die "Security token file '$cfg_tok' does not exist or is unreadable. Run 'oci session authenticate'."
       fi
 
+      TENANCY_ID="$cfg_tenancy"
       [[ -n "$COMP_ID" ]] || COMP_ID="${OCI_TENANCY:-$cfg_tenancy}"
       FALLBACK_REGION="${REGION:-$cfg_region}"
       ;;
@@ -455,6 +466,8 @@ preflight_oci() {
       [[ -n "$COMP_ID" ]] || COMP_ID="${OCI_TENANCY:-}"
       [[ -n "$COMP_ID" ]] || die "--compartment-ocid <OCID> (or \$OCI_TENANCY) is required when using --auth $AUTH_MODE."
       FALLBACK_REGION="${REGION:-${OCI_REGION:-}}"
+      TENANCY_ID="${OCI_TENANCY:-}"
+      if [[ "$COMP_ID" == ocid1.tenancy.* ]]; then TENANCY_ID="$COMP_ID"; fi
       ;;
     *)
       die "Unsupported --auth mode '$AUTH_MODE'. Expected: api_key | security_token | instance_obo_user | instance_principal | resource_principal."
@@ -472,11 +485,100 @@ preflight_oci() {
   log_info "OCI CLI preflight check PASSED."
 }
 
+discover_regions() {
+  TARGET_REGIONS=()
+  local req="$REGIONS_ARG"
+  if [[ -z "$req" ]]; then
+    if [[ -n "$REGION" ]]; then req="$REGION"; else req="all"; fi
+  fi
+
+  if [[ "$req" != "all" ]]; then
+    local r _rs=()
+    IFS=',' read -r -a _rs <<< "$req"
+    for r in "${_rs[@]}"; do
+      r="$(printf '%s' "$r" | tr -d '[:space:]')"
+      [[ -n "$r" ]] && TARGET_REGIONS+=("$r")
+    done
+    [[ ${#TARGET_REGIONS[@]} -gt 0 ]] || die "--regions resolved to an empty list."
+    log_info "Target OCI region(s) (user-selected): ${TARGET_REGIONS[*]}"
+    return 0
+  fi
+
+  if [[ -z "$TENANCY_ID" ]]; then
+    log_warn "Tenancy OCID unknown; cannot list subscribed regions. Falling back to '${FALLBACK_REGION:-default}'. Pass --regions <r1,r2> or export OCI_TENANCY."
+    TARGET_REGIONS=("$FALLBACK_REGION")
+    return 0
+  fi
+
+  log_info "Discovering subscribed OCI regions for tenancy $TENANCY_ID..."
+  local rjson home
+  rjson="$(run_oci "iam:region-subscription-list" "$TENANCY_ID" NONFATAL \
+    iam region-subscription list --tenancy-id "$TENANCY_ID")"
+  mapfile -t TARGET_REGIONS < <(printf '%s\n' "$rjson" \
+    | jq -r '.data[]? | select((.status // "READY") == "READY") | .["region-name"] // empty' 2>/dev/null \
+    | awk 'NF' | sort -u)
+  if [[ ${#TARGET_REGIONS[@]} -eq 0 ]]; then
+    log_warn "Could not list subscribed regions (see errors.jsonl). Falling back to '${FALLBACK_REGION:-default}'. Pass --regions <r1,r2> to override."
+    TARGET_REGIONS=("$FALLBACK_REGION")
+    return 0
+  fi
+  home="$(printf '%s\n' "$rjson" | jq -r '.data[]? | select(.["is-home-region"] == true) | .["region-name"] // empty' 2>/dev/null | head -n 1 || true)"
+  log_info "Found ${#TARGET_REGIONS[@]} subscribed region(s): ${TARGET_REGIONS[*]} (home: ${home:-unknown})"
+}
+
+# Uses regional OCI Resource Search to list, in ONE call per region, the compartment
+# of every non-terminated instance. Writes one compartment OCID per instance to $2.
+# Returns 1 if the search call failed (caller falls back to a full compartment scan).
+search_region_instances() {
+  local r="$1" out_file="$2" sjson
+  : > "$out_file"
+  rm -f "$COMP_ERR_FLAG"
+  CUR_REGION="$r"
+  sjson="$(run_oci "search:instances:${r:-default}" "${TENANCY_ID:-$COMP_ID}" NONFATAL \
+    search resource structured-search --query-text "query instance resources" --all)"
+  if [[ -f "$COMP_ERR_FLAG" ]]; then
+    rm -f "$COMP_ERR_FLAG"
+    return 1
+  fi
+  # Only a well-formed {"data":{"items":[...]}} response is authoritative; anything else
+  # (empty stdout, unexpected shape, truncated pagination) triggers a safe full-scan fallback.
+  if ! printf '%s\n' "$sjson" | jq -e '(.data | type) == "object" and ((.data.items // null) | type) == "array" and (has("opc-next-page") | not)' >/dev/null 2>&1; then
+    return 1
+  fi
+  printf '%s\n' "$sjson" | jq -r '
+    .data.items[] |
+    select(((.["lifecycle-state"] // "") | ascii_upcase) != "TERMINATED") |
+    .["compartment-id"] // empty
+  ' > "$out_file" 2>/dev/null || return 1
+  return 0
+}
+
+report_regions() {
+  preflight_oci
+  discover_regions
+  local r sfile n_inst n_comp
+  sfile="$TMP_WORK/report_search.txt"
+  printf '\n%-24s %-12s %-14s\n' "REGION" "INSTANCES" "COMPARTMENTS" >&2
+  printf '%-24s %-12s %-14s\n' "------------------------" "------------" "--------------" >&2
+  for r in "${TARGET_REGIONS[@]}"; do
+    if search_region_instances "$r" "$sfile"; then
+      n_inst="$(awk 'NF' "$sfile" | wc -l | tr -d ' ')"
+      n_comp="$(awk 'NF' "$sfile" | sort -u | wc -l | tr -d ' ')"
+      printf '%-24s %-12s %-14s\n' "${r:-default}" "$n_inst" "$n_comp" >&2
+    else
+      printf '%-24s %-12s %-14s\n' "${r:-default}" "ERROR" "search failed" >&2
+    fi
+  done
+  CUR_REGION=""
+  echo >&2
+  log_info "Tip: collect only specific regions with --regions sa-saopaulo-1,sa-vinhedo-1 (default: all subscribed regions)."
+}
+
 collect_oci() {
   prompt_collect_type_if_needed
   preflight_oci
 
-  log_info "Configuration: collect-type=$COLLECT_TYPE | region=${FALLBACK_REGION:-default} | days=$DAYS | resolution=$RESOLUTION | conn-timeout=${CONN_TIMEOUT}s | read-timeout=${READ_TIMEOUT}s | cmd-timeout=${CMD_TIMEOUT}s | retries=$RETRIES"
+  log_info "Configuration: collect-type=$COLLECT_TYPE | regions=${REGIONS_ARG:-${REGION:-all}} | days=$DAYS | resolution=$RESOLUTION | conn-timeout=${CONN_TIMEOUT}s | read-timeout=${READ_TIMEOUT}s | cmd-timeout=${CMD_TIMEOUT}s | retries=$RETRIES"
 
   mkdir -p "$RAW_DIR/by_compartment" "$RAW_DIR/by_image"
   if [[ "$RESUME" -eq 0 && "$COLLECT_TYPE" != "metrics-only" ]]; then
@@ -493,13 +595,14 @@ collect_oci() {
   : > "$comp_names_file"
   printf '%s\t%s\n' "$COMP_ID" "root" >> "$comp_names_file"
 
+  discover_regions
+
+  # Compartments are global (IAM): discover once, then fan out per region.
   local comp_list=()
   if [[ "$COLLECT_TYPE" == "metrics-only" ]]; then
     if [[ ! -s "$RAW_DIR/instances.jsonl" ]]; then
       die "--collect-type metrics-only requires an existing snapshot with instances in '$RAW_DIR/instances.jsonl'. Run '--collect-type inventory' first."
     fi
-    mapfile -t comp_list < <(jq -r '.["compartment-id"] // empty' "$RAW_DIR/instances.jsonl" 2>/dev/null | sort -u | awk 'NF')
-    log_info "Milestone 1 (collect-type=metrics-only): Targeting ${#comp_list[@]} compartment(s) that already contain active instances in '$RAW_DIR/instances.jsonl'."
   else
     log_info "Milestone 1 (collect-type=$COLLECT_TYPE): Discovering active compartments under $COMP_ID..."
     comp_list=("$COMP_ID")
@@ -509,9 +612,7 @@ collect_oci() {
         iam compartment list --compartment-id "$COMP_ID" --compartment-id-in-subtree true --access-level ACCESSIBLE --lifecycle-state ACTIVE --all)"
       printf '%s\n' "$comp_json" | jq -r '.data[]? | select(.["lifecycle-state"] == "ACTIVE" or .["lifecycle-state"] == null) | [(.id // ""), (.name // "unnamed")] | @tsv' >> "$comp_names_file" 2>/dev/null || true
       while IFS= read -r cid; do
-        if [[ -n "$cid" ]]; then
-          comp_list+=("$cid")
-        fi
+        [[ -n "$cid" ]] && comp_list+=("$cid")
       done < <(printf '%s\n' "$comp_json" | jq -r '.data[]? | select(.["lifecycle-state"] == "ACTIVE" or .["lifecycle-state"] == null) | .id // empty' 2>/dev/null || true)
     else
       local queue=("$COMP_ID") cur sub_json
@@ -530,8 +631,36 @@ collect_oci() {
       done
     fi
     mapfile -t comp_list < <(printf '%s\n' "${comp_list[@]}" | awk 'NF && !seen[$0]++')
-    log_info "Found ${#comp_list[@]} active compartment(s) to inspect (window: $start_time -> $end_time, resolution: $RESOLUTION)."
+    log_info "Found ${#comp_list[@]} active compartment(s) (window: $start_time -> $end_time, resolution: $RESOLUTION)."
   fi
+
+  # Build the (region|compartment) work list.
+  local work_file="$TMP_WORK/work_items.txt" comps_sorted="$TMP_WORK/comps_sorted.txt"
+  local sfile="$TMP_WORK/search_hits.txt" hits="$TMP_WORK/search_hits_in_scope.txt"
+  : > "$work_file"
+  printf '%s\n' "${comp_list[@]}" | awk 'NF' | sort -u > "$comps_sorted"
+  local r rlabel n_hit
+  for r in "${TARGET_REGIONS[@]}"; do
+    rlabel="${r:-default}"
+    if [[ "$COLLECT_TYPE" == "metrics-only" ]]; then
+      jq -r --arg r "$r" --arg fb "$FALLBACK_REGION" '
+        def rf: if . == null or . == "" then null elif . == "iad" then "us-ashburn-1" elif . == "phx" then "us-phoenix-1" else . end;
+        select(((._oci_region // null) // (.region | rf) // $fb) == $r) | .["compartment-id"] // empty
+      ' "$RAW_DIR/instances.jsonl" 2>/dev/null | awk 'NF' | sort -u | awk -v r="$r" '{ print r "|" $0 }' >> "$work_file"
+      log_info "[region $rlabel] metrics-only: $(grep -c "^${r}|" "$work_file" || true) compartment(s) with VMs in snapshot."
+      continue
+    fi
+    if search_region_instances "$r" "$sfile"; then
+      awk 'NF' "$sfile" | sort -u | comm -12 - "$comps_sorted" > "$hits"
+      n_hit="$(wc -l < "$hits" | tr -d ' ')"
+      log_info "[region $rlabel] OCI Search: $(awk 'NF' "$sfile" | wc -l | tr -d ' ') instance(s) in $n_hit of ${#comp_list[@]} compartment(s) -> scanning only those."
+      awk -v r="$r" 'NF { print r "|" $0 }' "$hits" >> "$work_file"
+    else
+      log_warn "[region $rlabel] OCI Search unavailable; falling back to full scan of ${#comp_list[@]} compartment(s) in this region (slower)."
+      awk -v r="$r" 'NF { print r "|" $0 }' "$comps_sorted" >> "$work_file"
+    fi
+  done
+  CUR_REGION=""
 
   local do_net_storage=1 do_metrics=1
   case "$COLLECT_TYPE" in
@@ -552,50 +681,63 @@ collect_oci() {
     "vol_w|oci_blockstore|VolumeWriteOps[${RESOLUTION}].groupBy(resourceId).rate()"
   )
 
-  local total_comps="${#comp_list[@]}"
-  local comp_idx=0 comps_with_vms=0
+  local work_items=()
+  mapfile -t work_items < "$work_file"
+  local total_items="${#work_items[@]}"
+  local item_idx=0 comps_with_vms=0 item key tag
   local cid cname chash cdir inst_json inst_count ad mspec mkey mns mquery mjson raw_json
 
-  for cid in "${comp_list[@]}"; do
-    comp_idx=$((comp_idx + 1))
+  log_info "Collection plan: $total_items (region|compartment) work item(s) across ${#TARGET_REGIONS[@]} region(s)."
+
+  for item in "${work_items[@]}"; do
+    item_idx=$((item_idx + 1))
+    r="${item%%|*}"
+    cid="${item#*|}"
+    rlabel="${r:-default}"
+    key="${r}|${cid}"
+    CUR_REGION="$r"
     cname="$(awk -F'\t' -v id="$cid" '$1 == id { print $2; exit }' "$comp_names_file" 2>/dev/null || true)"
     [[ -n "$cname" ]] || cname="compartment"
+    tag="[$item_idx/$total_items] [$rlabel]"
 
-    if [[ "$RESUME" -eq 1 ]] && grep -Fxq "$cid" "$RAW_DIR/.done_compartments" 2>/dev/null; then
-      log_info "[$comp_idx/$total_comps] Skipping already completed compartment (--resume): $cname ($cid)"
+    if [[ "$RESUME" -eq 1 ]] && grep -Fxq "$key" "$RAW_DIR/.done_compartments" 2>/dev/null; then
+      log_info "$tag Skipping already completed compartment (--resume): $cname ($cid)"
       continue
     fi
 
     rm -f "$COMP_ERR_FLAG"
     if [[ -s "$RAW_DIR/errors.jsonl" ]]; then
-      if jq -c --arg cid "$cid" 'select(.compartment_id != $cid)' "$RAW_DIR/errors.jsonl" > "$TMP_WORK/errors_filtered.jsonl" 2>/dev/null; then
+      if jq -c --arg cid "$cid" --arg r "$r" 'select(.compartment_id != $cid or (.region // "") != $r)' "$RAW_DIR/errors.jsonl" > "$TMP_WORK/errors_filtered.jsonl" 2>/dev/null; then
         mv "$TMP_WORK/errors_filtered.jsonl" "$RAW_DIR/errors.jsonl"
       fi
     fi
 
-    chash="$(printf '%s' "$cid" | sha256sum | cut -c1-16)"
-    cdir="$RAW_DIR/by_compartment/$chash"
+    chash="$(printf '%s' "$key" | sha256sum | cut -c1-16)"
+    cdir="$RAW_DIR/by_compartment/${rlabel}/$chash"
 
     if [[ "$COLLECT_TYPE" == "metrics-only" ]]; then
       mkdir -p "$cdir"
       if [[ ! -s "$cdir/instances.jsonl" ]]; then
-        jq -c --arg cid "$cid" 'select(.["compartment-id"] == $cid)' "$RAW_DIR/instances.jsonl" > "$cdir/instances.jsonl" 2>/dev/null || true
+        jq -c --arg cid "$cid" --arg r "$r" --arg fb "$FALLBACK_REGION" '
+          def rf: if . == null or . == "" then null elif . == "iad" then "us-ashburn-1" elif . == "phx" then "us-phoenix-1" else . end;
+          select(.["compartment-id"] == $cid and (((._oci_region // null) // (.region | rf) // $fb) == $r))
+        ' "$RAW_DIR/instances.jsonl" > "$cdir/instances.jsonl" 2>/dev/null || true
       fi
       inst_count="$(wc -l < "$cdir/instances.jsonl" | tr -d ' ')"
-      log_info "[$comp_idx/$total_comps] Collecting MQL metrics for compartment: $cname ($cid) [$inst_count existing VM(s)]"
+      log_info "$tag Collecting MQL metrics for compartment: $cname ($cid) [$inst_count existing VM(s)]"
     else
       rm -rf "$cdir"
       mkdir -p "$cdir"
-      log_info "[$comp_idx/$total_comps] Collecting compartment: $cname ($cid)"
+      log_info "$tag Collecting compartment: $cname ($cid)"
 
       inst_json="$(run_oci "compute:instance-list" "$cid" NONFATAL compute instance list --compartment-id "$cid" --all)"
-      printf '%s\n' "$inst_json" | jq -c '.data[]? | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING")' > "$cdir/instances.jsonl" 2>/dev/null || : > "$cdir/instances.jsonl"
+      printf '%s\n' "$inst_json" | jq -c --arg r "$r" '.data[]? | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") | . + {"_oci_region": $r}' > "$cdir/instances.jsonl" 2>/dev/null || : > "$cdir/instances.jsonl"
       inst_count="$(wc -l < "$cdir/instances.jsonl" | tr -d ' ')"
     fi
 
     if [[ "$inst_count" -gt 0 ]]; then
       comps_with_vms=$((comps_with_vms + 1))
-      log_verb "[$comp_idx/$total_comps] Found $inst_count active VM(s) in $cname. Collecting attached resources (collect-type=$COLLECT_TYPE)..."
+      log_verb "$tag Found $inst_count active VM(s) in $cname. Collecting attached resources (collect-type=$COLLECT_TYPE)..."
 
       if [[ "$do_net_storage" -eq 1 ]]; then
         raw_json="$(run_oci "compute:vnic-attachment-list" "$cid" NONFATAL compute vnic-attachment list --compartment-id "$cid" --all)"
@@ -623,7 +765,7 @@ collect_oci() {
           printf '%s\n' "$raw_json" | jq -c '.data[]?' >> "$cdir/boot_volumes.jsonl" 2>/dev/null || true
         done < <(jq -r '.["availability-domain"] // empty' "$cdir/instances.jsonl" 2>/dev/null | sort -u)
 
-        log_verb "[$comp_idx/$total_comps] Storage & Network in $cname: vnics=$(wc -l < "$cdir/vnics.jsonl" | tr -d ' '), boot_vols=$(wc -l < "$cdir/boot_volumes.jsonl" | tr -d ' '), block_vols=$(wc -l < "$cdir/volumes.jsonl" | tr -d ' ')."
+        log_verb "$tag Storage & Network in $cname: vnics=$(wc -l < "$cdir/vnics.jsonl" | tr -d ' '), boot_vols=$(wc -l < "$cdir/boot_volumes.jsonl" | tr -d ' '), block_vols=$(wc -l < "$cdir/volumes.jsonl" | tr -d ' ')."
       elif [[ "$COLLECT_TYPE" != "metrics-only" ]]; then
         for empty_f in vnic_attachments vnics volume_attachments volumes boot_volume_attachments boot_volumes; do
           : > "$cdir/${empty_f}.jsonl"
@@ -636,13 +778,13 @@ collect_oci() {
         for mspec in "${mql_specs[@]}"; do
           IFS='|' read -r mkey mns mquery <<< "$mspec"
           if [[ "$MAX_METRIC_TIMEOUTS" -gt 0 && "$consec_metric_timeouts" -ge "$MAX_METRIC_TIMEOUTS" ]]; then
-            log_warn "[$comp_idx/$total_comps] Circuit breaker active: skipping 'monitoring:${mkey}' in $cname after $consec_metric_timeouts consecutive MQL timeouts."
+            log_warn "$tag Circuit breaker active: skipping 'monitoring:${mkey}' in $cname after $consec_metric_timeouts consecutive MQL timeouts."
             echo "1" > "$COMP_ERR_FLAG"
             record_oci_error "monitoring:${mkey}" "$cid" 124 0 "CIRCUIT_BREAKER_SKIPPED_AFTER_TIMEOUTS" "Skipped after $consec_metric_timeouts consecutive MQL timeouts in compartment"
             continue
           fi
 
-          log_verb "[$comp_idx/$total_comps] Querying MQL metric '${mkey}' ($mns) for $cname..."
+          log_verb "$tag Querying MQL metric '${mkey}' ($mns) for $cname..."
           mjson="$(run_oci "monitoring:${mkey}" "$cid" NONFATAL \
             monitoring metric-data summarize-metrics-data \
             --compartment-id "$cid" \
@@ -667,32 +809,33 @@ collect_oci() {
             {metric_key: $mk, resource_id: $rid, timestamp: .timestamp, value: .value}
           ' >> "$cdir/metrics.jsonl" 2>/dev/null || true
         done
-        log_verb "[$comp_idx/$total_comps] MQL metrics in $cname: $(wc -l < "$cdir/metrics.jsonl" | tr -d ' ') datapoint(s) collected."
+        log_verb "$tag MQL metrics in $cname: $(wc -l < "$cdir/metrics.jsonl" | tr -d ' ') datapoint(s) collected."
       else
         : > "$cdir/metrics.jsonl"
       fi
     else
-      log_verb "[$comp_idx/$total_comps] 0 active VMs in $cname (skipping VNIC, volume, and metric queries)."
+      log_verb "$tag 0 active VMs in $cname (skipping VNIC, volume, and metric queries)."
       for empty_f in vnic_attachments vnics volume_attachments volumes boot_volume_attachments boot_volumes metrics; do
         [[ -f "$cdir/${empty_f}.jsonl" ]] || : > "$cdir/${empty_f}.jsonl"
       done
     fi
 
     if [[ ! -f "$COMP_ERR_FLAG" ]]; then
-      if ! grep -Fxq "$cid" "$RAW_DIR/.done_compartments" 2>/dev/null; then
-        printf '%s\n' "$cid" >> "$RAW_DIR/.done_compartments"
+      if ! grep -Fxq "$key" "$RAW_DIR/.done_compartments" 2>/dev/null; then
+        printf '%s\n' "$key" >> "$RAW_DIR/.done_compartments"
       fi
     else
-      log_warn "[$comp_idx/$total_comps] Compartment $cname ($cid) experienced isolated timeout/errors; left unmarked for '--resume' retry. Moving to next compartment..."
+      log_warn "$tag Compartment $cname ($cid) experienced isolated timeout/errors; left unmarked for '--resume' retry. Moving on..."
     fi
   done
+  CUR_REGION=""
 
   for stream in instances vnic_attachments vnics volume_attachments volumes boot_volume_attachments boot_volumes metrics; do
     if [[ "$COLLECT_TYPE" == "metrics-only" && "$stream" != "metrics" && -s "$RAW_DIR/${stream}.jsonl" ]]; then
       continue
     fi
     : > "$RAW_DIR/${stream}.jsonl"
-    for f in "$RAW_DIR"/by_compartment/*/"${stream}.jsonl"; do
+    for f in "$RAW_DIR"/by_compartment/*/*/"${stream}.jsonl"; do
       if [[ -f "$f" ]]; then
         cat "$f" >> "$RAW_DIR/${stream}.jsonl"
       fi
@@ -701,14 +844,17 @@ collect_oci() {
 
   if [[ "$COLLECT_TYPE" != "metrics-only" ]]; then
     : > "$RAW_DIR/images.jsonl"
-    local img_id ihash img_file img_json
-    while IFS= read -r img_id; do
+    local img_pair img_r img_id ihash img_file img_json
+    while IFS= read -r img_pair; do
+      img_r="${img_pair%%|*}"
+      img_id="${img_pair#*|}"
       [[ -n "$img_id" ]] || continue
-      ihash="$(printf '%s' "$img_id" | sha256sum | cut -c1-16)"
+      ihash="$(printf '%s|%s' "$img_r" "$img_id" | sha256sum | cut -c1-16)"
       img_file="$RAW_DIR/by_image/${ihash}.json"
       if [[ ! -s "$img_file" ]]; then
         rm -f "$COMP_ERR_FLAG"
-        log_verb "Inspecting OS image metadata: $img_id"
+        CUR_REGION="$img_r"
+        log_verb "[${img_r:-default}] Inspecting OS image metadata: $img_id"
         img_json="$(run_oci "compute:image-get" "$img_id" NONFATAL compute image get --image-id "$img_id")"
         if [[ ! -f "$COMP_ERR_FLAG" ]]; then
           printf '%s\n' "$img_json" | jq -c '.data | select(type == "object" and (.id // "") != "")' > "$img_file" 2>/dev/null || rm -f "$img_file"
@@ -717,46 +863,53 @@ collect_oci() {
       if [[ -s "$img_file" ]]; then
         cat "$img_file" >> "$RAW_DIR/images.jsonl"
       fi
-    done < <(jq -r '.["image-id"] // empty' "$RAW_DIR/instances.jsonl" 2>/dev/null | sort -u)
+    done < <(jq -r '"\(._oci_region // "")|\(.["image-id"] // "")"' "$RAW_DIR/instances.jsonl" 2>/dev/null | sort -u)
+    CUR_REGION=""
   fi
 
-  local total_vms total_errs total_metrics
+  local total_vms total_errs total_metrics regions_json per_region
   total_vms="$(jq -s 'unique_by(.id) | length' "$RAW_DIR/instances.jsonl" 2>/dev/null || echo 0)"
   total_metrics="$(wc -l < "$RAW_DIR/metrics.jsonl" 2>/dev/null | tr -d ' ' || echo 0)"
   total_errs="$(wc -l < "$RAW_DIR/errors.jsonl" 2>/dev/null | tr -d ' ' || echo 0)"
+  regions_json="$(printf '%s\n' "${TARGET_REGIONS[@]}" | jq -R . | jq -s -c . 2>/dev/null || echo '[]')"
+  per_region="$(jq -s -c 'unique_by(.id) | group_by(._oci_region // "default") | map({key: (.[0]._oci_region // "default"), value: length}) | from_entries' "$RAW_DIR/instances.jsonl" 2>/dev/null || echo '{}')"
 
   jq -n \
     --arg generated_at "$(ts_now)" \
     --arg collect_type "$COLLECT_TYPE" \
     --arg root_compartment "$COMP_ID" \
     --arg region "${FALLBACK_REGION}" \
+    --argjson regions "$regions_json" \
+    --argjson instances_by_region "$per_region" \
     --arg start_time "$start_time" \
     --arg end_time "$end_time" \
     --arg resolution "$RESOLUTION" \
-    --argjson compartments_scanned "$total_comps" \
+    --argjson work_items "$total_items" \
     --argjson compartments_with_vms "$comps_with_vms" \
     --argjson instances_collected "$total_vms" \
     --argjson metric_datapoints "$total_metrics" \
     --argjson errors_recorded "$total_errs" \
     '{
-      schema_version: "1.1",
+      schema_version: "1.2",
       generated_at: $generated_at,
       collect_type: $collect_type,
       root_compartment: $root_compartment,
       default_region: $region,
+      regions: $regions,
       window: {start_time: $start_time, end_time: $end_time, resolution: $resolution},
       counts: {
-        compartments_scanned: $compartments_scanned,
+        region_compartment_items: $work_items,
         compartments_with_vms: $compartments_with_vms,
         instances_collected: $instances_collected,
+        instances_by_region: $instances_by_region,
         metric_datapoints: $metric_datapoints,
         errors_recorded: $errors_recorded
       }
     }' > "$RAW_DIR/manifest.json"
 
-  log_info "Milestone 1 ($COLLECT_TYPE) complete: $total_vms instance(s) across $comps_with_vms/$total_comps compartment(s), $total_metrics metric datapoint(s) saved in '$RAW_DIR' (isolated CLI errors/timeouts: $total_errs)."
+  log_info "Milestone 1 ($COLLECT_TYPE) complete: $total_vms instance(s) across ${#TARGET_REGIONS[@]} region(s) $per_region, $total_metrics metric datapoint(s) saved in '$RAW_DIR' (isolated CLI errors/timeouts: $total_errs)."
   if [[ "$total_vms" -eq 0 ]]; then
-    log_warn "0 instances were found in region '${FALLBACK_REGION:-default}'. Verify if your VMs reside in another OCI region (pass '--region <region-name>') or check compartment IAM permissions."
+    log_warn "0 instances found in region(s): ${TARGET_REGIONS[*]:-default}. Run './oci_to_mc.sh regions' to list subscribed regions and instance counts, then pass '--regions <r1,r2>'."
   fi
 }
 
@@ -984,6 +1137,19 @@ def mask_opt($anon; $do_anon; $kind):
   else tostring
   end;
 
+def region_full:
+  if . == null or . == "" then ""
+  elif . == "iad" then "us-ashburn-1"
+  elif . == "phx" then "us-phoenix-1"
+  else tostring
+  end;
+
+def inst_region($loc):
+  if (._oci_region // "") != "" then ._oci_region
+  elif (.region // "") != "" then (.region | region_full)
+  else $loc
+  end;
+
 def opt_str:
   if . == null or . == "" then null else tostring end;
 
@@ -1094,7 +1260,7 @@ JQ_EOF
       ($img["operating-system"] // "Linux") as $os_name |
       ($img["operating-system-version"] // "") as $os_ver |
       (if ($os_name | test("Windows"; "i")) then "Windows" else "Linux" end) as $os_type |
-      ($inst.region // (if $loc != "" then $loc else ($inst["availability-domain"] // "") end)) as $hloc |
+      (($inst | inst_region($loc)) as $ir | if $ir != "" then $ir else ($inst["availability-domain"] // "") end) as $hloc |
       [
         ($inst.id | mask($ctx.anon; $anon; "id")),
         (($inst["display-name"] // $inst.id) | mask($ctx.anon; $anon; "name")),
@@ -1199,6 +1365,7 @@ JQ_EOF
       (
         (if $anon == 0 then [{k: "oci:ocid", v: ($inst.id | tostring)}] else [] end) +
         [
+          {k: "oci:region", v: ($inst | inst_region($loc))},
           {k: "oci:shape", v: ($inst.shape // "VM.Standard")},
           {k: "oci:ocpus", v: ($ocpus | tostring)}
         ] +
@@ -1235,6 +1402,7 @@ JQ_EOF
 check_local_deps
 case "$MODE" in
   preflight) preflight_oci ;;
+  regions)   report_regions ;;
   collect)   collect_oci ;;
   export)    export_mc ;;
   run)       collect_oci; export_mc ;;

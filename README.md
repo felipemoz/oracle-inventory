@@ -12,6 +12,7 @@ A resilient, standalone Bash utility for extracting compute instance inventory, 
   - `inventory` (`2`, fast / no-metrics): Extracts VMs, OS images, VNICs, Boot/Block Volumes, and Tags while skipping slow 30-day OCI Monitoring MQL queries.
   - `compute-only` (`3`, ultra-fast): Extracts only VMs (`compute instance list`) and OS images (`compute image get`).
   - `metrics-only` (`4`, complementary): Queries MQL metrics **only** on compartments that already contain active VMs in `--raw-dir/instances.jsonl`.
+- **Multi-Region by Default**: Automatically discovers every subscribed OCI region (`iam region-subscription list`) — not only the home region where the tenancy was created — and uses regional **OCI Resource Search** to scan only the compartments that actually contain instances in each region (with a safe full-scan fallback). Restrict with `--regions sa-saopaulo-1,sa-vinhedo-1`.
 - **Two Decoupled Milestones**:
   - **Milestone 1 (`collect`)**: Discovers compartments, queries compute instances, attached boot/block volumes, VNICs, and extracts historical performance metrics into a local JSONL snapshot (`./oci_raw_snapshot/`).
   - **Milestone 2 (`export`)**: Processes the snapshot **100% offline** (zero OCI or GCP network calls) and outputs validated Migration Center CSVs (`./mc_export_csv/`).
@@ -105,7 +106,29 @@ chmod +x oci_to_mc.sh
 ./oci_to_mc.sh run
 ```
 
-### 2. Choosing the Collection Type (`--collect-type`)
+### 2. Validate Regions First (`regions` mode)
+
+List every subscribed region with its instance and compartment counts before collecting:
+
+```bash
+./oci_to_mc.sh regions
+#
+# REGION                   INSTANCES    COMPARTMENTS
+# ------------------------ ------------ --------------
+# sa-saopaulo-1            42           7
+# sa-vinhedo-1             11           3
+# us-ashburn-1             0            0
+```
+
+By default `run` / `collect` cover **all** subscribed regions. To limit the scope:
+
+```bash
+./oci_to_mc.sh run --collect-type inventory --regions sa-saopaulo-1,sa-vinhedo-1 -v
+```
+
+Each VM is exported with `HostingLocation` set to the region it was collected from, plus an `oci:region` tag in `tagInfo.csv`.
+
+### 3. Choosing the Collection Type (`--collect-type`)
 
 You can select the extraction scope interactively when running in a terminal, or pass `-t / --collect-type` for `nohup` / background runs:
 
@@ -124,7 +147,7 @@ nohup ./oci_to_mc.sh collect --collect-type metrics-only -v > nohup_metrics.out 
 ./oci_to_mc.sh export
 ```
 
-### 3. Standalone Workflow (Step-by-Step)
+### 4. Standalone Workflow (Step-by-Step)
 
 ```bash
 # Step 1: Validate configuration and IAM permissions
@@ -137,7 +160,7 @@ nohup ./oci_to_mc.sh collect --collect-type metrics-only -v > nohup_metrics.out 
 ./oci_to_mc.sh export --out-dir ./mc_export_csv
 ```
 
-### 4. Anonymized Execution
+### 5. Anonymized Execution
 
 To mask hostnames, IPs, MACs, and OCIDs via SHA-256 before sharing CSVs:
 
@@ -155,7 +178,8 @@ To mask hostnames, IPs, MACs, and OCIDs via SHA-256 before sharing CSVs:
 | `-t, --collect-type <TYPE>` | `full` (or interactive) | `full` (`1`), `inventory` (`2`), `compute-only` (`3`), or `metrics-only` (`4`) |
 | `-v, --verbose` | Enabled | Verbose progress + full OCI CLI command trace with elapsed timers |
 | `-q, --quiet` | Disabled | Quiet mode (summary and errors only) |
-| `--region <REGION>` | From config | OCI region override (e.g. `sa-saopaulo-1`, `us-ashburn-1`) |
+| `--regions <all\|r1,r2>` | `all` subscribed | Regions to collect (e.g. `sa-saopaulo-1,sa-vinhedo-1`) |
+| `--region <REGION>` | — | Single-region shortcut (same as `--regions <REGION>`) |
 | `--auth <MODE>` | Auto-detected | `api_key`, `security_token`, `instance_obo_user` (Cloud Shell), or `instance_principal` |
 | `--config-file <PATH>` | `~/.oci/config` | OCI CLI configuration file |
 | `--profile <NAME>` | `DEFAULT` | OCI configuration profile |
